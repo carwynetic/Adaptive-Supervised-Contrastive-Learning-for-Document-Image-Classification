@@ -1,0 +1,32 @@
+{
+  "repo_id": "PaddlePaddle/PP-OCRv6_small_rec_safetensors",
+  "revision": "fe049fb103f57443fe8840c54ed06b702f3c1de5",
+  "source": "https://huggingface.co/PaddlePaddle/PP-OCRv6_small_rec_safetensors",
+  "files": [
+    {
+      "file": "README.md",
+      "bytes": 23785,
+      "sha256": "ac3debb5e615b1297a69c34e6c5c5930c3a17382462b91e8784d731a604ab0f9"
+    },
+    {
+      "file": "config.json",
+      "bytes": 1083,
+      "sha256": "8693fd8485e8543e13d0f6dde3891a3f4af9a47fc4e3a391fbed71f8015c899e"
+    },
+    {
+      "file": "inference.yml",
+      "bytes": 150579,
+      "sha256": "ab078671bb49f06228eadccd34f1bb501e157f7a047095ffb943ba81512c77d1"
+    },
+    {
+      "file": "model.safetensors",
+      "bytes": 21204736,
+      "sha256": "f65a332afe5aa663f0b9d5706f4ae8457b5b4058a842d5c1eb22df505c27d642"
+    },
+    {
+      "file": "preprocessor_config.json",
+      "bytes": 206177,
+      "sha256": "2b24fa36f548893f26a931cf44f1a1a6b2b14ed7e2f8f8e28e6848801a8278db"
+    }
+  ]
+}

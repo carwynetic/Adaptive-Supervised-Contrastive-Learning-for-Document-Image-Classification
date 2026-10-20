@@ -1,0 +1,1 @@
+# Adaptive-Supervised-Contrastive-Learning-for-Document-Image-Classification

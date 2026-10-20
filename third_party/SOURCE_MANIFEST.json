@@ -1,0 +1,110 @@
+{
+  "source": "G:\\My Drive\\DIC\\transformers\\src\\transformers\\models",
+  "transformers_runtime_tested": "5.19.0",
+  "changes": [
+    "Absolute imports for shared Transformers utilities and other model packages; package-local imports retained.",
+    "Development-only modular and conversion sources omitted.",
+    "OCR config metadata adapted from SubConfigSpec to sub_configs for Transformers 5.19.0; model architecture and checkpoint values preserved.",
+    "Generated-file banners replaced to mark independently maintained local copies."
+  ],
+  "files": [
+    {
+      "file": "layoutlmv3/__init__.py",
+      "source_sha256": "5750674c761ca2434c12248a8245eac5cb3c2c0ebb081a3db21e3c22810ab9a9",
+      "sha256": "02eb353e4114798a3b80c8db4bc5e709d523a04aa54e3229ff99a9ec4e9f34da"
+    },
+    {
+      "file": "layoutlmv3/configuration_layoutlmv3.py",
+      "source_sha256": "07e40fe69f65ce3ab84e7101a6eca7aa03bf5eb6dcb2424b71ac35ebb0bc9457",
+      "sha256": "5da1c9fbfcb9e1edabbb558c9585ddcd797abf52c5cea23d36ed3c2c0bfe56f0"
+    },
+    {
+      "file": "layoutlmv3/image_processing_layoutlmv3.py",
+      "source_sha256": "a66647a7401cc3e819370b80eac204c3fb00cda7665eb7a8990e686624a53224",
+      "sha256": "6d167e9f3f9f27b3960e6e767e1252456289b73a6e0bd860731bc487e3086986"
+    },
+    {
+      "file": "layoutlmv3/image_processing_pil_layoutlmv3.py",
+      "source_sha256": "68cf15a82e3df09dee70f077cc269f306dbf091a059b226f83f5f97e8427d898",
+      "sha256": "65a2b7c0f7ea9314b46af14849315a9df583e78e34f9dc918f24887ed8c5d5b7"
+    },
+    {
+      "file": "layoutlmv3/modeling_layoutlmv3.py",
+      "source_sha256": "81b53a50fb571e500075386d0cbdc4c1f88fc1942afe3837d237e27652c57115",
+      "sha256": "9fe6c45c3748d8b0bf1d8532717a174f193b6d823fc250a767f98e44594bd27c"
+    },
+    {
+      "file": "layoutlmv3/processing_layoutlmv3.py",
+      "source_sha256": "acc9011b544b1b83af59bca1979b5575d852d1bb771bd4a1c14930551e4d48e6",
+      "sha256": "eb495a2bfbe735d1536a87fc0241eed935cfb854d15735d1e739b493acca0cdb"
+    },
+    {
+      "file": "layoutlmv3/tokenization_layoutlmv3.py",
+      "source_sha256": "785b88b889d37eb6cc1b43d5e679a2d899015ffacbe84261dde774efd88815da",
+      "sha256": "453c9f89e52af6a7e2245076433cfe365e619115b3e98a08b5a6ed7c43df4a8d"
+    },
+    {
+      "file": "pp_ocrv6_small_det/__init__.py",
+      "source_sha256": "f449e6f8952d2740508d4de40691d6bf1c1514e3807a2097eff34b7c04a4f20a",
+      "sha256": "924b2599762da4d1f958994cd788c867be0d9d5d611d2ab68ca227f446395275"
+    },
+    {
+      "file": "pp_ocrv6_small_det/configuration_pp_ocrv6_small_det.py",
+      "source_sha256": "0d9af77f438be2efe4099cc9eb18197878c969af72873a390deb176ec9336674",
+      "sha256": "4c1ed9b7782dc471d313003b9a1eb66527561dcbdf9a651794a6326c09b0a606"
+    },
+    {
+      "file": "pp_ocrv6_small_det/modeling_pp_ocrv6_small_det.py",
+      "source_sha256": "606d37da7ce07e4916a7f9e75f64a206c17b3925c26a2ecb30270ba12376a6b7",
+      "sha256": "38d76f5d85a064723b363b8a3b6eb79cb7e99328d842602f321239f4f093e0a1"
+    },
+    {
+      "file": "pp_ocrv6_small_rec/__init__.py",
+      "source_sha256": "e6b386613f92fc2fe99c7c3354f03f0096df7a5d7a549f36edabe0207260c9b3",
+      "sha256": "aebe41ba5dd1d5605d4a49c39e16dbaaee9f194d629b6a30d0f555f3afd9930d"
+    },
+    {
+      "file": "pp_ocrv6_small_rec/configuration_pp_ocrv6_small_rec.py",
+      "source_sha256": "85b108a592f3622ce843233b51c69d874aa94d0260fef7f7a9594ffbc073089e",
+      "sha256": "31c613b893a34904730a5380909ec72a80cde68b5d8f6af54b437bdced6ba764"
+    },
+    {
+      "file": "pp_ocrv6_small_rec/image_processing_pp_ocrv6_small_rec.py",
+      "source_sha256": "58b02647f1daee263fe5cd44dc10dec619619fa210bf881dc1a505951660293f",
+      "sha256": "222818ff48985bdfb5b50d8cde70728db3134ee1303b61ff211dd91d5ecb3bae"
+    },
+    {
+      "file": "pp_ocrv6_small_rec/modeling_pp_ocrv6_small_rec.py",
+      "source_sha256": "496606bda667fe61a14f2636b3c4475aa38d404c7fa17488320b6b64f705f7bd",
+      "sha256": "0ad5e5fae6d7c029fee37a798b713cf0ca27748059a1a6d74bb8e4c48a15a610"
+    }
+  ],
+  "verification": {
+    "checkpoint_loading": "all three local models: no missing, unexpected, mismatched or error keys",
+    "layoutlmv3_forward_shape": [
+      1,
+      201,
+      768
+    ],
+    "small_det_forward_shape": [
+      1,
+      1,
+      736,
+      1056
+    ],
+    "small_rec_forward_shape": [
+      1,
+      40,
+      18710
+    ],
+    "small_rec_decode": "passed",
+    "runtime": {
+      "transformers": "5.19.0",
+      "torch": "2.14.1",
+      "torchvision": "0.29.1"
+    },
+    "limitations": [
+      "Synthetic-image smoke test; no OCR accuracy or detection polygon postprocessing evaluation."
+    ]
+  }
+}
