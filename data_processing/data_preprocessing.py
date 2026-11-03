@@ -14,7 +14,7 @@ from torchvision.transforms import Compose
 # Đọc ảnh và Augmentation
 # ==============================================================================
 
-def read_image(img_path: Path | str) -> torch.Tensor:
+def read_image(img_path: Path | str):
     path_obj = Path(img_path)
     with Image.open(path_obj) as img:
         img_rgb = img.convert("RGB")
@@ -22,7 +22,6 @@ def read_image(img_path: Path | str) -> torch.Tensor:
 
 
 read_image_as_tensor = read_image
-
 
 class RandomShear:
     def __init__(self, max_angle: float = 10.0):
@@ -106,7 +105,6 @@ def get_transforms(
 
 get_contrastive_transforms = get_transforms
 
-
 # ==============================================================================
 # PYTORCH DATASET CHO RVL-CDIP
 # ==============================================================================
@@ -130,11 +128,11 @@ class RVLCDIPDataset(Dataset):
 
     def __init__(
         self,
-        data_dir: Path | str,
+        data_dir: Path,
         split: str = "train",
-        transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-        is_contrastive: bool = False,
-        max_samples: Optional[int] = None,
+        transform = None,
+        is_contrastive = False,
+        max_samples = None,
     ):
         super().__init__()
         self.data_dir = Path(data_dir)
@@ -154,15 +152,12 @@ class RVLCDIPDataset(Dataset):
                     if max_samples is not None and len(self.samples) >= max_samples:
                         break
 
-    def __len__(self) -> int:
+    def __len__(self):
         return len(self.samples)
 
-    def __getitem__(self, idx: int) -> DatasetItem:
+    def __getitem__(self, idx: int):
         rel_img_path, label = self.samples[idx]
-        full_img_path = self.images_dir / rel_img_path.replace("/", os.sep).replace("\\", os.sep)
-
-        if not full_img_path.exists():
-            raise FileNotFoundError(f"Không tìm thấy file ảnh: {full_img_path}")
+        full_img_path = self.images_dir / rel_img_path
 
         tensor_img = read_image(full_img_path)
 
@@ -170,27 +165,9 @@ class RVLCDIPDataset(Dataset):
             v1 = self.transform(tensor_img) if self.transform is not None else tensor_img.clone()
             v2 = self.transform(tensor_img) if self.transform is not None else tensor_img.clone()
             return {"views": (v1, v2), "label": label, "image_path": str(full_img_path)}
-
-        if self.transform is not None:
-            tensor_img = self.transform(tensor_img)
-
-        return {"image": tensor_img, "label": label, "image_path": str(full_img_path)}
-
-
-def build_dataset(
-    root: Path | str,
-    split: str = "train",
-    transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-    is_contrastive: bool = False,
-    max_samples: Optional[int] = None,
-) -> RVLCDIPDataset:
-    return RVLCDIPDataset(
-        data_dir=Path(root),
-        split=split,
-        transform=transform,
-        is_contrastive=is_contrastive,
-        max_samples=max_samples,
-    )
+        else:
+            img = self.transform(tensor_img) if self.transform is not None else tensor_img
+            return {"image": img, "label": label, "image_path": str(full_img_path)}
 
 
 # ==============================================================================
@@ -198,49 +175,16 @@ def build_dataset(
 # ==============================================================================
 
 class LayoutLMv3DataCollator:
-    def __init__(
-        self,
-        processor: Optional[Any] = None,
-        max_length: int = 512,
-        return_tensors: str = "pt",
-    ):
+    def __init__(self, processor = None):
         self.processor = processor
-        self.max_length = max_length
-        self.return_tensors = return_tensors
 
-        # Tắt Tesseract OCR mặc định của HF processor nếu có
-        if hasattr(self.processor, "apply_ocr"):
-            self.processor.apply_ocr = False
-        if hasattr(getattr(self.processor, "image_processor", None), "apply_ocr"):
-            self.processor.image_processor.apply_ocr = False
+    def _process_images(self, images):
+        if self.processor is not None:
+            img_proc = getattr(self.processor, "image_processor", self.processor)
+            return img_proc(images=images, apply_ocr=False, return_tensors="pt")
+        return {"pixel_values": torch.stack(images)}
 
-    def _encode_images(
-        self,
-        images: List[torch.Tensor],
-        words: Optional[List[List[str]]] = None,
-        boxes: Optional[List[List[List[int]]]] = None,
-    ):
-        if self.processor is None:
-            return {"pixel_values": torch.stack(images)}
-
-        # Nếu có words và boxes (khi đã chạy OCR trước) -> tokenize đầy đủ
-        if words is not None and boxes is not None:
-            return self.processor(
-                images=images,
-                text=words,
-                boxes=boxes,
-                max_length=self.max_length,
-                padding=True,
-                truncation=True,
-                return_tensors=self.return_tensors,
-            )
-
-        # Nếu chỉ có ảnh (contrastive views hoặc trích xuất visual backbone)
-        # Chỉ gọi image_processor để tạo pixel_values (B, 3, 224, 224), không đụng vào text
-        img_proc = getattr(self.processor, "image_processor", self.processor)
-        return img_proc(images=images, return_tensors=self.return_tensors)
-
-    def __call__(self, batch: List[DatasetItem]) -> Dict[str, Any]:
+    def __call__(self, batch):
         batch = [item for item in batch if item]
         if not batch:
             return {}
@@ -248,117 +192,19 @@ class LayoutLMv3DataCollator:
         labels = torch.tensor([item["label"] for item in batch], dtype=torch.long)
         image_paths = [item["image_path"] for item in batch if "image_path" in item]
 
-        # 1. Chế độ Contrastive Learning (2 views)
         if "views" in batch[0]:
-            views_1 = [item["views"][0] for item in batch]
-            views_2 = [item["views"][1] for item in batch]
-            res = {
-                "view1": self._encode_images(views_1),
-                "view2": self._encode_images(views_2),
+            return {
+                "view1": self._process_images([item["views"][0] for item in batch]),
+                "view2": self._process_images([item["views"][1] for item in batch]),
                 "labels": labels,
+                "image_paths": image_paths,
             }
-            if image_paths:
-                res["image_paths"] = image_paths
-            return res
 
-        # 2. Chế độ Single-view
-        images = [item["image"] for item in batch]
-        words = [item["words"] for item in batch] if "words" in batch[0] else None
-        boxes = [item["boxes"] for item in batch] if "boxes" in batch[0] else None
+        res = self._process_images([item["image"] for item in batch])
+        res["labels"] = labels
+        res["image_paths"] = image_paths
+        return res
 
-        encoding = self._encode_images(images, words=words, boxes=boxes)
-        encoding["labels"] = labels
-        if image_paths:
-            encoding["image_paths"] = image_paths
-        return encoding
-
-
-# ==============================================================================
-# BUILD DATALOADER
-# ==============================================================================
-
-def build_dataloader(
-    data_dir: Path | str,
-    split: str = "train",
-    processor: Optional[Any] = None,
-    batch_size: int = 16,
-    num_workers: int = 2,
-    shuffle: Optional[bool] = None,
-    transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-    is_contrastive: bool = False,
-    max_samples: Optional[int] = None,
-    pin_memory: bool = True,
-    drop_last: Optional[bool] = None,
-) -> DataLoader:
-    if shuffle is None:
-        shuffle = (split == "train")
-    if drop_last is None:
-        drop_last = (split == "train" and is_contrastive)
-
-    dataset = RVLCDIPDataset(
-        data_dir=Path(data_dir),
-        split=split,
-        transform=transform,
-        is_contrastive=is_contrastive,
-        max_samples=max_samples,
-    )
-    collator = LayoutLMv3DataCollator(processor=processor) if processor is not None else None
-
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        collate_fn=collator,
-        pin_memory=pin_memory and torch.cuda.is_available(),
-        drop_last=drop_last,
-    )
-
-
-def get_dataloaders(
-    data_dir: Path | str,
-    processor: Optional[Any] = None,
-    batch_size: int = 16,
-    num_workers: int = 2,
-    transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-    is_contrastive: bool = False,
-    max_samples_per_split: Optional[int] = None,
-) -> Tuple[DataLoader, DataLoader, DataLoader]:
-    dir_path = Path(data_dir)
-    train_loader = build_dataloader(
-        data_dir=dir_path,
-        split="train",
-        processor=processor,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        shuffle=True,
-        transform=transform,
-        is_contrastive=is_contrastive,
-        max_samples=max_samples_per_split,
-    )
-    val_loader = build_dataloader(
-        data_dir=dir_path,
-        split="val",
-        processor=processor,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        shuffle=False,
-        transform=None,
-        is_contrastive=False,
-        max_samples=max_samples_per_split,
-    )
-    test_loader = build_dataloader(
-        data_dir=dir_path,
-        split="test",
-        processor=processor,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        shuffle=False,
-        transform=None,
-        is_contrastive=False,
-        max_samples=max_samples_per_split,
-    )
-    return train_loader, val_loader, test_loader
 
 
 
