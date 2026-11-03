@@ -8,6 +8,8 @@ Output:
     - words = list[str]  : list of recognized words
     - boxes = List[list[int]] : list of bounding boxes, [x0,y0,x1,y1] normalized to [0,1000]
 """
+from transformers.models.nougat.tokenization_nougat import normalize_list_like_lines
+from networkx import normalized_cut_size
 from multiprocessing.sharedctypes import Value
 from threading import local
 from pathlib import Path
@@ -67,8 +69,8 @@ class DocumentOCR:
         
         #xác định thư mục gốc của project
         root_dir = Path(__file__).resolve().parents[1]
-        self.det_config_dir = Path(det_config_dir) if not det_config_dir else root_dir/'config'/ "pp_ocrv6_small_det"
-        self.rec_config_dir = Path(rec_config_dir) if not rec_config_dir else root_dir/'config'/ "pp_ocrv6_small_rec"
+        self.det_config_dir = Path(det_config_dir) if det_config_dir else root_dir/'configs'/ "pp_ocrv6_small_det"
+        self.rec_config_dir = Path(rec_config_dir) if rec_config_dir else root_dir/'configs'/ "pp_ocrv6_small_rec"
         self.det_checkpoint_dir = Path(det_checkpoint_dir) if det_checkpoint_dir else root_dir/"checkpoints" / "pp_ocrv6_small_det"
         self.rec_checkpoint_dir = Path(rec_checkpoint_dir) if rec_checkpoint_dir else root_dir/"checkpoints" / "pp_ocrv6_small_rec"
 
@@ -85,7 +87,7 @@ class DocumentOCR:
         self.det_model.eval()
 
         #Intialize Recognition
-        self.rec_processor = AutoImageProcessor.from_pretrained(
+        self.rec_processor = PPOCRV6SmallRecImageProcessor.from_pretrained(
             self.rec_config_dir, local_files_only =True
         )
         rec_config  = PPOCRV6SmallRecConfig.from_pretrained(
@@ -93,18 +95,19 @@ class DocumentOCR:
         )
         self.rec_model = PPOCRV6SmallRecForTextRecognition.from_pretrained(
             self.rec_checkpoint_dir, config = rec_config, local_files_only=True
-        )
+        ).to(self.device)
+        self.rec_model.eval()
 
     #adapter transfer image from multi-sources (tensor, .tif, pil.image, path) to PIL.image (RGB)   
     @staticmethod
     def _to_pil_image(image : Union[Image.Image, torch.Tensor, str, Path]) -> Image.Image:
         if isinstance(image, (str,Path)): #variable imae is str OR path?
             return Image.open(image).convert("RGB")
-        if isinstance(image, torch.Ternsor):
+        if isinstance(image, torch.Tensor):
             if image.ndim==3:
                 return TF.to_pil_image(image).convert("RGB")
             if image.ndim==4 and image.shape[0]==1:
-                return TF.to_pil_image(image.squeeze(0).convert("RGB"))
+                return TF.to_pil_image(image.squeeze(0)).convert("RGB")
             raise ValueError(f"Tensor shape is not valid: {image.shape}")
         if isinstance(image, Image.Image):
             return image.convert("RGB") if image.mode != "RGB" else image
@@ -142,8 +145,129 @@ class DocumentOCR:
         #   - pixel = 1,2,3... id of components
         # _ : number of component, we don't use it 
         labeled_mask, _ = label(binary_mask)
-        
+        slices = find_objects(labeled_mask)
+
+        raw_boxes =[]
+        scale_x = orig_width /float(map_w)
+        scale_y = orig_height / float(map_h)
+
+        for s in slices:
+            if s is None:
+                continue
+            y_slice, x_slice = s
+            box_w = x_slice.stop - x_slice.start
+            box_h = y_slice.stop - y_slice.start
+
+            if box_w < self.min_box_size or box_h <self.min_box_size:
+                continue
+            #add padding
+            #mo rong chieu cao 2 huong , avoid slicing words
+            pad_h = int(box_h * 0.7) + 3 
+            pad_w = int(box_w * 0.2 ) +2
+
+            y0_map = max(0, y_slice.start - pad_h)
+            y1_map = min(map_h, y_slice.stop + pad_h)
+            x0_map = max(0, x_slice.start - pad_w)
+            x1_map = min(map_w, x_slice.stop + pad_w)
+
+            x0 = int(x0_map * scale_x)
+            y0 = int(y0_map * scale_y)
+            x1 = int(x1_map * scale_x)
+            y1 = int(y1_map * scale_y)
+
+            x0 = max(0, min(orig_width, x0))
+            y0 = max(0, min(orig_height, y0))
+            x1 = max(x0 + 1, min(orig_width, x1))
+            y1 = max(y0 + 1, min(orig_height, y1))
+
+            raw_boxes.append([x0, y0, x1, y1])
+        raw_boxes.sort(key = lambda b : (b[1], b[0]))
+        return raw_boxes
+    
+    @torch.inference_mode()
+    def extract_words_and_boxes(
+        self, image : Union[Image.Image, torch.Tensor, str, Path]
+    )-> Tuple[List[str], List[List[int]]]:
+        pil_img = self._to_pil_image(image)
+        width, height = pil_img.size
+
+        #1. detection
+
+        #configs\pp_ocrv6_small_det\preprocessor_config.json:
+        #   input ipl image raw
+        #   output: dict {"pixel_values": tensor_anh_kich_thuoc_(1, 3, H, W)}
+        det_inputs = self.det_processor(images = pil_img, return_tensors="pt")
+        det_inputs = {k : v.to(self.device) for k, v in det_inputs.items()}
+
+        #trong modeling_pp_ocrv6_small_det.py:
+        #   input  : pixel_values   là ảnh tensor (B , 3 , H, W), cụ thể lấy từ dict (output det_inputs)
+        #   output của PPOCRV6SmallDetForObjectDetection sẽ là last_hidden_state is xác suất văn bản ~ pob_map
+        det_outputs = self.det_model(pixel_values = det_inputs["pixel_values"])
 
 
+        detected_boxes = self._extract_boxes_from_prob_map(
+            det_outputs.last_hidden_state, width, height
+        )
+
+        #khoi tao danh sach rong
+        words : List[str] =[]
+        normalized_boxes : List[List[int]] =[]
+
+        #2. Regconition tren tung crop
+        if detected_boxes:
+            # use method .crop((x0, y0, x1,y1)) of PIL to crop many images from 'pil_img' raw
+            crop_images = [pil_img.crop(box) for box in detected_boxes]
+
+            batch_size = 32
+            for i in range(0, len(crop_images), batch_size):
+                batch_crops = crop_images[i: i+batch_size]
+                batch_boxes = detected_boxes[i : i+batch_size]
+
+                #preprocessing of rec
+                rec_inputs = self.rec_processor(images=batch_crops, return_tensors='pt')
+                rec_inputs = {k : v.to(self.device) for k, v in rec_inputs.items()}
+                rec_outputs = self.rec_model(pixel_values = rec_inputs["pixel_values"])
+
+                decoded_list = self.rec_processor.post_process_text_recognition(rec_outputs)
+
+                for decoded, box in zip(decoded_list, batch_boxes):
+                    text_str = decoded.get("text", "").strip()
+                    if text_str:
+                        sub_tokens = text_str.split()
+                        norm_b = self.normalize_box(box, width, height)
+                        for token in sub_tokens:
+                            words.append(token)
+                            normalized_boxes.append(norm_b)
+        # 3. fall back document has no words
+        if not words: 
+            words = ["document has no words / error"]
+            normalized_boxes = [[0,0,1000,1000]]
+
+        return words, normalized_boxes
+
+    def __call__(
+        self, image : Union[Image.Image, torch.Tensor, str, Path]
+    ) -> Tuple[List[str], List[List[int]]]:
+        return self.extract_words_and_boxes(image)
 
 
+if __name__ == "__main__":
+    print("khoi tao DocumentOCR from checkpoints")
+    ocr_engine = DocumentOCR()
+    
+    print("OCR 's Device :", ocr_engine.device)
+
+    demo_image_path= "nhap/2072197187.tif"
+    out_words, out_boxes = ocr_engine(demo_image_path)
+
+    print(f"Number of words: {len(out_words)}")
+    print(f"Number of  boxes: {len(out_boxes)}")
+    
+    # In ra 10 tu dau tien va hop toa do tuong ung
+    print("\n--- 10 tu dau tien tim thay ---")
+    for idx, (w, b) in enumerate(zip(out_words[:100], out_boxes[:100])):
+        print(f"[{idx + 1}] Word: '{w}' | Box [0, 1000]: {b}")
+
+    full_text = " ".join(out_words)
+    print("\n--- Toan bo van ban trich xuat duoc ---")
+    print(full_text)
