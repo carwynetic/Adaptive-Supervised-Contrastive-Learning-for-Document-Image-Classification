@@ -8,6 +8,7 @@ Output:
     - words = list[str]  : list of recognized words
     - boxes = List[list[int]] : list of bounding boxes, [x0,y0,x1,y1] normalized to [0,1000]
 """
+from threading import local
 from pathlib import Path
 from typing import List, Tuple, Union, Optional
 
@@ -63,4 +64,40 @@ class DocumentOCR:
         self.det_threshold  = det_threshold
         self.min_box_size   = min_box_size
         
-        root_dir = Path(__file__).resolve().
+        #xác định thư mục gốc của project
+        root_dir = Path(__file__).resolve().parents[1]
+        self.det_config_dir = Path(det_config_dir) if not det_config_dir else root_dir/'config'/ "pp_ocrv6_small_det"
+        self.rec_config_dir = Path(rec_config_dir) if not rec_config_dir else root_dir/'config'/ "pp_ocrv6_small_rec"
+        self.det_checkpoint_dir = Path(det_checkpoint_dir) if det_checkpoint_dir else root_dir/"checkpoints" / "pp_ocrv6_small_det"
+        self.rec_checkpoint_dir = Path(rec_checkpoint_dir) if rec_checkpoint_dir else root_dir/"checkpoints" / "pp_ocrv6_small_rec"
+
+        #Intialize Detection
+        self.det_processor = AutoImageProcessor.from_pretrained(
+            self.det_config_dir, local_files_only=True
+        )
+        det_config = PPOCRV6SmallDetConfig.from_pretrained(
+            self.det_config_dir, local_files_only=True
+        )
+        self.det_model = PPOCRV6SmallDetForObjectDetection.from_pretrained(
+            self.det_checkpoint_dir, config = det_config, local_files_only=True
+        ).to(self.device)
+        self.det_model.eval()
+
+        #Intialize Recognition
+        self.rec_processor = AutoImageProcessor.from_pretrained(
+            self.rec_config_dir, local_files_only =True
+        )
+        rec_config  = PPOCRV6SmallRecConfig.from_pretrained(
+            self.rec_config_dir, local_files_only=True
+        )
+        self.rec_model = PPOCRV6SmallRecForTextRecognition.from_pretrained(
+            self.rec_checkpoint_dir, config = rec_config, local_files_only=True
+        )
+
+    #adapter transfer image from multi-sources (tensor, .tif, pil.image, path) to PIL.image (RGB)   
+    @staticmethod
+    def _to_pil_image(image : Union[Image.Image, torch.Tensor, str, Path]) -> Image.Image:
+        if isinstance(image, (str,Path)): #variable imae is str OR path?
+            return Image.open(image).convert("RGB")
+
+
