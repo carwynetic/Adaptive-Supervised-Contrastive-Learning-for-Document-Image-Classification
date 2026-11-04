@@ -160,6 +160,11 @@ class DocumentOCR:
 
             if box_w < self.min_box_size or box_h <self.min_box_size:
                 continue
+            #avoiding detect chinese word
+            if (box_w / max(1, box_h) > 20.0) or (box_h / max(1, box_w) > 20.0): 
+                continue
+
+            
             #add padding
             #mo rong chieu cao 2 huong , avoid slicing words
             pad_h = int(box_h * 0.7) + 3 
@@ -183,7 +188,8 @@ class DocumentOCR:
             raw_boxes.append([x0, y0, x1, y1])
         raw_boxes.sort(key = lambda b : (b[1], b[0]))
         return raw_boxes
-    
+
+
     @torch.inference_mode()
     def extract_words_and_boxes(
         self, image : Union[Image.Image, torch.Tensor, str, Path]
@@ -233,11 +239,15 @@ class DocumentOCR:
                 for decoded, box in zip(decoded_list, batch_boxes):
                     text_str = decoded.get("text", "").strip()
                     if text_str:
-                        sub_tokens = text_str.split()
+                        clean_text = "".join(ch for ch in text_str if ch.isascii()).strip()
+                        if not clean_text:
+                            continue
+                        sub_tokens = clean_text.split()
                         norm_b = self.normalize_box(box, width, height)
                         for token in sub_tokens:
-                            words.append(token)
-                            normalized_boxes.append(norm_b)
+                            if any(c.isalnum() for c in token):
+                                words.append(token)
+                                normalized_boxes.append(norm_b)
         # 3. fall back document has no words
         if not words: 
             words = ["document has no words / error"]

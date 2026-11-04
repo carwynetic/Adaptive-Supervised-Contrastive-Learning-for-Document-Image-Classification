@@ -15,15 +15,28 @@ from third_party.pp_ocrv6_small_rec import (
     PPOCRV6SmallRecForTextRecognition,
     PPOCRV6SmallRecImageProcessor,
 )
+from third_party.pp_doclayout_v3 import (
+    PPDocLayoutV3ForObjectDetection,
+    PPDocLayoutV3ImageProcessor,
+)
 from transformers import AutoImageProcessor
+from transformers.conversion_mapping import USER_REGISTERED_MAPPINGS
 
+# Đăng ký weight mapping cho PP-DocLayoutV3 chạy dưới package cục bộ third_party
+USER_REGISTERED_MAPPINGS.add("pp_doclayout_v3")
+USER_REGISTERED_MAPPINGS.add("PPDocLayoutV3ForObjectDetection")
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def load_model(model_class, folder):
+    # Đọc config từ configs/ và load weights từ checkpoints/
+    config_dir = ROOT / "configs" / folder
+    checkpoint_dir = ROOT / "checkpoints" / folder
+
     model, info = model_class.from_pretrained(
-        ROOT / "checkpoints" / folder,
+        checkpoint_dir,
+        config=str(config_dir),
         local_files_only=True,
         output_loading_info=True,
     )
@@ -40,9 +53,10 @@ def main():
     torch.set_num_threads(2)
     image = Image.new("RGB", (320, 224), "white")
 
+    # 1. LayoutLMv3
     model = load_model(LayoutLMv3Model, "layoutlmv3-base")
     processor = LayoutLMv3Processor.from_pretrained(
-        ROOT / "checkpoints" / "layoutlmv3-base",
+        ROOT / "configs" / "layoutlmv3-base",
         apply_ocr=False,
         local_files_only=True,
     )
@@ -58,11 +72,11 @@ def main():
     del model, result, processor, inputs
     gc.collect()
 
+    # 2. PP-OCRv6 Small Det
     model = load_model(PPOCRV6SmallDetForObjectDetection, "pp_ocrv6_small_det")
     processor = AutoImageProcessor.from_pretrained(
-        ROOT / "checkpoints" / "pp_ocrv6_small_det", local_files_only=True
+        ROOT / "configs" / "pp_ocrv6_small_det", local_files_only=True
     )
-    # The detection processor lives in Transformers (PP-OCRv5 Server Det).
     processed = processor(images=image, return_tensors="pt")
     result = model(pixel_values=processed["pixel_values"]).last_hidden_state
     tensors = result if isinstance(result, (tuple, list)) else (result,)
@@ -71,9 +85,10 @@ def main():
     del model, result, tensors, processor, processed
     gc.collect()
 
+    # 3. PP-OCRv6 Small Rec
     model = load_model(PPOCRV6SmallRecForTextRecognition, "pp_ocrv6_small_rec")
     processor = PPOCRV6SmallRecImageProcessor.from_pretrained(
-        ROOT / "checkpoints" / "pp_ocrv6_small_rec", local_files_only=True
+        ROOT / "configs" / "pp_ocrv6_small_rec", local_files_only=True
     )
     processed = processor(images=image, return_tensors="pt")
     outputs = model(pixel_values=processed["pixel_values"])
@@ -81,7 +96,31 @@ def main():
     decoded = processor.post_process_text_recognition(outputs)
     assert len(decoded) == 1 and "text" in decoded[0]
     print(f"Small Rec forward/decode OK: {tuple(outputs.last_hidden_state.shape)}", flush=True)
-    print("PASS: all three local models loaded and ran; this is not an OCR accuracy test.", flush=True)
+    del model, outputs, processor, processed, decoded
+    gc.collect()
+
+    # 4. PP-DocLayoutV3
+    model = load_model(PPDocLayoutV3ForObjectDetection, "pp_doclayout_v3")
+    processor = PPDocLayoutV3ImageProcessor.from_pretrained(
+        ROOT / "configs" / "pp_doclayout_v3", local_files_only=True
+    )
+    layout_image = Image.new("RGB", (800, 800), "white")
+    processed = processor(images=layout_image, return_tensors="pt")
+    outputs = model(**processed)
+    assert torch.isfinite(outputs.logits).all()
+    assert torch.isfinite(outputs.pred_boxes).all()
+
+    target_sizes = [layout_image.size[::-1]]
+    results = processor.post_process_object_detection(outputs, target_sizes=target_sizes)
+    assert len(results) == 1 and "boxes" in results[0]
+    print(
+        f"DocLayoutV3 forward/post-process OK: logits={tuple(outputs.logits.shape)}, boxes={tuple(outputs.pred_boxes.shape)}",
+        flush=True,
+    )
+    del model, outputs, processor, processed, results, layout_image
+    gc.collect()
+
+    print("PASS: all four local models loaded and ran; this is not an OCR accuracy test.", flush=True)
 
 
 if __name__ == "__main__":
