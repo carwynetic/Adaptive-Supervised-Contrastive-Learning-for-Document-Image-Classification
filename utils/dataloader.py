@@ -1,22 +1,21 @@
 from pathlib import Path
-from typing import Any, Callable, Optional, Tuple
 
 import torch
 from torch.utils.data import DataLoader
 
-from data_processing.data_preprocessing import (
+from data_processing.data_processing import (
     LayoutLMv3DataCollator,
     RVLCDIPDataset,
 )
 
 
 def build_dataset(
-    root: Path | str,
+    root: Path,
     split: str = "train",
-    transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    transform = None,
     is_contrastive: bool = False,
-    max_samples: Optional[int] = None,
-) -> RVLCDIPDataset:
+    max_samples = None,
+):
     """Hàm tiện ích (utility) khởi tạo RVLCDIPDataset."""
     return RVLCDIPDataset(
         data_dir=Path(root),
@@ -30,16 +29,16 @@ def build_dataset(
 def build_dataloader(
     data_dir: Path | str,
     split: str = "train",
-    processor: Optional[Any] = None,
+    processor = None,
     batch_size: int = 16,
     num_workers: int = 2,
-    shuffle: Optional[bool] = None,
-    transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    shuffle = None,
+    transform = None,
     is_contrastive: bool = False,
-    max_samples: Optional[int] = None,
+    max_samples = None,
     pin_memory: bool = True,
-    drop_last: Optional[bool] = None,
-) -> DataLoader:
+    drop_last = None,
+):
     """Hàm tiện ích (utility) tạo 1 DataLoader đơn lẻ cho 1 split (train/val/test)."""
     if shuffle is None:
         shuffle = (split == "train")
@@ -68,14 +67,14 @@ def build_dataloader(
 
 def get_dataloaders(
     data_dir: Path | str,
-    processor: Optional[Any] = None,
+    processor = None,
     batch_size: int = 16,
     num_workers: int = 2,
-    transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    transform = None,
     is_contrastive: bool = False,
-    max_samples_per_split: Optional[int] = None,
-) -> Tuple[DataLoader, DataLoader, DataLoader]:
-    """Hàm tiện ích (utility) tạo đồng thời cả 3 DataLoader: train, val, test."""
+    max_samples_per_split = None,
+):
+
     dir_path = Path(data_dir)
     train_loader = build_dataloader(
         data_dir=dir_path,
