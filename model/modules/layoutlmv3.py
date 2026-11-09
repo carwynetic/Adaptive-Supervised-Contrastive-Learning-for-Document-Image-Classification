@@ -40,13 +40,7 @@ class LayoutLMv3BackboneOutput:
     cls_token: torch.Tensor
     hidden_states: Tuple[torch.Tensor, ...]
 
-
 class LayoutLMv3Backbone(nn.Module):
-    """
-    LayoutLMv3 Backbone wrapper phục vụ trích xuất đặc trưng đa phương thái (Text + Layout + Vision)
-    và hỗ trợ lấy hidden states tại tất cả các tầng cho mô hình Early Exit.
-    """
-
     def __init__(
         self,
         config_dir: Optional[Union[str, Path]] = None,
