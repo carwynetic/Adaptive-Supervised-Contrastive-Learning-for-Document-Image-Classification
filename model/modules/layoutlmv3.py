@@ -199,5 +199,3 @@ if __name__ == "__main__":
     print("\nEarly Exit CLS Tensors extracted:")
     for layer, feat in exit_features.items():
         print(f"  - Exit Layer {layer:2d}: shape = {feat.shape}, norm = {feat.norm(dim=-1).mean().item():.4f}")
-
-    print("\n[PASSED] LayoutLMv3Backbone Module verified successfully.")
