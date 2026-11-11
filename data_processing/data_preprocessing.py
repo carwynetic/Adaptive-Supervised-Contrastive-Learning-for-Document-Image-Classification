@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 import random
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypedDict
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypedDict, Union
 
 import numpy as np
 from PIL import Image
@@ -206,7 +206,42 @@ class LayoutLMv3DataCollator:
         return res
 
 
+#
+#   soft labels generator cho supcon-st (theo ConOSR - AAAI 2023)
+#
 
-
-
-
+def get_smooth_labels(
+    labels : torch.Tensor,
+    classid_list : Union[int, Sequence[int]] = 16,
+    smoothing_coeff : float = 0.1, 
+)-> torch.Tensor:
+    """
+    Tạo nhãn mềm (Soft Targets) cho Supervised Contrastive Learning (SupCon-ST).
+    Tái hiện chính xác nguyên bản hàm `get_smooth_labels` trong ConOSR (utils.py).
+    Args:
+        labels: Tensor 1D nhãn lớp nguyên [batch_size].
+        classid_list: Số lượng lớp (int) hoặc danh sách các ID lớp (ví dụ: range(16)).
+        smoothing_coeff: Hệ số làm mịn nhãn (epsilon, mặc định 0.1).
+    Returns:
+        targets: Tensor 2D [batch_size, num_classes] đã được làm mịn.
+    """
+    if isinstance(classid_list, int):
+        classes = list(range(classid_list))
+    else:
+        classes = list(classid_list)
+    num_classes = len(classes)
+    label_positive = 1.0 - smoothing_coeff
+    label_negative = smoothing_coeff / (num_classes - 1)
+    targets = label_negative * torch.ones(
+        [labels.shape[0], num_classes],
+        dtype=torch.float32,
+        device=labels.device,
+        requires_grad=False,
+    )
+    for j, label in enumerate(labels):
+        val = label.item()
+        if val not in classes:
+            continue
+        idx = classes.index(val)
+        targets[j, idx] = label_positive
+    return targets

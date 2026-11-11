@@ -1,4 +1,4 @@
-# data_processing package (All components unified in data_preprocessing.py)
+# data_processing package
 from data_processing.data_preprocessing import (
     DatasetItem,
     GaussianNoise,
@@ -8,11 +8,14 @@ from data_processing.data_preprocessing import (
     RandomErase,
     RandomShear,
     TwoCropTransform,
+    get_contrastive_transforms,
+    get_smooth_labels,
+    read_image_as_tensor,
+)
+from utils.dataloader import (
     build_dataloader,
     build_dataset,
-    get_contrastive_transforms,
     get_dataloaders,
-    read_image_as_tensor,
 )
 
 __all__ = [
@@ -29,4 +32,5 @@ __all__ = [
     "GaussianNoise",
     "TwoCropTransform",
     "get_contrastive_transforms",
+    "get_smooth_labels",
 ]
