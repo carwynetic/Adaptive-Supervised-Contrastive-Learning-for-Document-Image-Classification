@@ -33,7 +33,11 @@ if TYPE_CHECKING:
     )
     from model.modules.ocr_ppdoclayout_ppocrv6small import DocumentOCR
     from model.modules.ocr_pytesseract import TesseractOCR
+    from model.modules.projector import SupConProjector
 
+  
+
+  
 _EE_EXPORTS = {
     "POSSIBLE_EXITS",
     "EXITS_PLACEMENT_PRESETS",
@@ -81,7 +85,9 @@ def __getattr__(name: str):
         from model.modules.ocr_pytesseract import TesseractOCR
         return TesseractOCR
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
+    if name=="SupConProjector":
+        from model.modules.projector import SupConProjector
+        return SupConProjector
 
 __all__ = [
     *_EE_EXPORTS,

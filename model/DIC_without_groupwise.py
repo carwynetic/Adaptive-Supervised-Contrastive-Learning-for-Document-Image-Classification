@@ -21,11 +21,10 @@ import torch.nn.functional as F
 
 from model.modules.layoutlmv3 import (
     LayoutLMv3Backbone, 
-    LayoutLMv3Config
+    LayoutLMv3ClassificationHead,
+    LayoutLMv3Config,
 )
-
-from third_party.layoutlmv3 import LayoutLMv3ClassificationHead
-
+from model.modules.projector import SupConProjector
 
 @dataclass 
 class DICOutput:
@@ -67,10 +66,11 @@ class DICWithoutGroupwise(nn.Module):
 
         # 2. Các Projection Heads cho SupCon-ST
         self.projection_heads = nn.ModuleDict({
-            str(layer): nn.Sequential(
-                nn.Linear(hidden_size, hidden_size),
-                nn.GELU(),
-                nn.Linear(hidden_size, projection_dim),
+            str(layer): SupConProjector(
+                in_dim=hidden_size,
+                hidden_dim=hidden_size,
+                out_dim=projection_dim,
+                l2_normalize=True,
             )
             for layer in self.exit_layers
         })
@@ -152,8 +152,7 @@ class DICWithoutGroupwise(nn.Module):
 
             # Vector chiếu tương phản (chuẩn hóa L2 lên siêu cầu)
             if compute_projections and projections_dict is not None:
-                proj = self.projection_heads[str(layer)](cls_token)
-                projections_dict[layer] = F.normalize(proj, p=2, dim=-1)
+               projections_dict[layer] = self.projection_heads[str(layer)](cls_token)
 
         final_layer = self.exit_layers[-1]
         final_logits = logits_dict[final_layer]
