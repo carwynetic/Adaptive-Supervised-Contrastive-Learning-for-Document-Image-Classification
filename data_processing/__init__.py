@@ -1,5 +1,5 @@
 # data_processing package
-from data_processing.data_preprocessing import (
+from data_processing.data_processing import (
     DatasetItem,
     GaussianNoise,
     LayoutLMv3DataCollator,
@@ -8,7 +8,7 @@ from data_processing.data_preprocessing import (
     RandomErase,
     RandomShear,
     TwoCropTransform,
-    get_contrastive_transforms,
+    get_transforms,
     get_smooth_labels,
     read_image_as_tensor,
 )
@@ -31,6 +31,6 @@ __all__ = [
     "RandomErase",
     "GaussianNoise",
     "TwoCropTransform",
-    "get_contrastive_transforms",
+    "get_transforms",
     "get_smooth_labels",
 ]
