@@ -29,11 +29,10 @@ from data_processing.data_preprocessing import (
     RandomErase,
     RandomShear,
     TwoCropTransform,
-    build_dataloader,
     get_contrastive_transforms,
     read_image_as_tensor,
 )
-
+from utils.dataloader import build_dataloader
 
 def print_tensor_info(name: str, tensor: torch.Tensor, show_sample_values: bool = True, indent: int = 4) -> None:
     """Hàm in thông tin chi tiết và dữ liệu mẫu của một Tensor."""

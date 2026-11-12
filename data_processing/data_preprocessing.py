@@ -1,11 +1,13 @@
+import os
 from pathlib import Path
 import random
-from typing import Dict, List, Tuple, TypedDict
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypedDict, Union
 
 import numpy as np
 from PIL import Image
 import torch
-from torch.utils.data import Dataset
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms import functional as TF
 from torchvision.transforms import Compose
 # ==============================================================================
@@ -91,7 +93,7 @@ def get_transforms(
     max_shear: float = 10.0,
     brightness_range: Tuple[float, float] = (0.8, 1.2),
     p_erase: float = 0.5,
-    noise_std: float = 0,
+    noise_std: float = 8.0,
 ):
     return Compose([
         RandomShear(max_angle=max_shear),
@@ -99,6 +101,9 @@ def get_transforms(
         GaussianNoise(mean=0.0, std=noise_std),
         RandomErase(p=p_erase),
     ])
+
+
+get_contrastive_transforms = get_transforms
 
 # ==============================================================================
 # PYTORCH DATASET CHO RVL-CDIP
