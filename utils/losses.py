@@ -309,7 +309,7 @@ if __name__ == "__main__":
     print("Testing Unified Loss Modules with ConOSR (utils/losses.py)...")
     print("=" * 65)
 
-    from data_processing.data_preprocessing import get_smooth_labels
+    from data_processing import get_smooth_labels
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Target Device: {device}")

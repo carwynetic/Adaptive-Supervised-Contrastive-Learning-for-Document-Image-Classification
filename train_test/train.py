@@ -23,7 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import torch
 from torch.utils.data import DataLoader
 
-from data_processing.data_preprocessing import get_contrastive_transforms
+from data_processing import get_transforms
 from model.DIC_without_groupwise import DICWithoutGroupwise
 from train_test.trainer import DICTrainer
 from utils.dataloader import build_dataloader
@@ -164,7 +164,7 @@ def main():
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             is_contrastive=True,
-            transform=get_contrastive_transforms(),
+            transform=get_transforms(),
             max_samples=args.max_samples,
         )
         # Stage 2: Dữ liệu 1 view chuẩn cho huấn luyện phân loại

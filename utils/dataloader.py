@@ -4,7 +4,7 @@ from typing import Any, Callable, Optional, Tuple
 import torch
 from torch.utils.data import DataLoader
 
-from data_processing.data_preprocessing import (
+from data_processing.data_processing import (
     LayoutLMv3DataCollator,
     RVLCDIPDataset,
 )
