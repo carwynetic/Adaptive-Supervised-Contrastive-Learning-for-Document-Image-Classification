@@ -8,6 +8,8 @@ from utils.losses import (
     MultiExitSupConLoss,
     MultiExitCELoss,
 )
+from utils.lars_wrapper import LARSWrapper
+from utils.schedulers import LinearWarmupCosineAnnealingLR
 
 __all__ = [
     "build_dataset",
@@ -16,4 +18,6 @@ __all__ = [
     "SupConLoss",
     "MultiExitSupConLoss",
     "MultiExitCELoss",
+    "LARSWrapper",
+    "LinearWarmupCosineAnnealingLR",
 ]
