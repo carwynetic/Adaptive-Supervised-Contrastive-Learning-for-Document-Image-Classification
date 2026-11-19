@@ -1,14 +1,17 @@
-from utils.checkpoint import (
-    CHECKPOINT_SCHEMA_VERSION,
-    CheckpointManager,
-    build_model_from_checkpoint,
-    extract_model_metadata,
-    is_hf_pretrained_model,
-    load_checkpoint,
-    load_model_weights,
-    save_checkpoint,
-    unwrap_model,
-)
+try:
+    from utils.checkpoint import (
+        CHECKPOINT_SCHEMA_VERSION,
+        CheckpointManager,
+        build_model_from_checkpoint,
+        extract_model_metadata,
+        is_hf_pretrained_model,
+        load_checkpoint,
+        load_model_weights,
+        save_checkpoint,
+        unwrap_model,
+    )
+except ImportError:
+    pass
 from utils.dataloader import (
     build_dataloader,
     build_dataset,
