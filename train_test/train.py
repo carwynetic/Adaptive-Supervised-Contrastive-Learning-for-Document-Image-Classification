@@ -24,7 +24,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from data_processing import get_transforms
-from model.DIC_without_groupwise import DICWithoutGroupwise
+from model import DIC, DICWithoutGroupwise
 from train_test.trainer import DICTrainer
 from utils.dataloader import build_dataloader
 
@@ -129,11 +129,18 @@ def main():
 
     # 1. Khởi tạo mô hình mạng
     print("\n[1/3] Khởi tạo mô hình DIC...")
-    model = DICWithoutGroupwise(
-        num_classes=args.num_classes,
-        exit_layers=args.exit_layers,
-        projection_dim=128,
-    )
+    if args.train_type == "groupwise":
+        model = DIC(
+            num_classes=args.num_classes,
+            exit_layers=args.exit_layers,
+            projection_dim=128,
+        )
+    else:
+        model = DICWithoutGroupwise(
+            num_classes=args.num_classes,
+            exit_layers=args.exit_layers,
+            projection_dim=128,
+        )
 
     # 2. Khởi tạo DICTrainer
     print("\n[2/3] Khởi tạo DICTrainer...")
