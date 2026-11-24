@@ -82,7 +82,7 @@ class DocumentOCR:
         self.layout_threshold = layout_threshold
         
         # Xac dinh thu muc goc cua project
-        root_dir = Path(__file__).resolve().parents[1]
+        root_dir = Path(__file__).resolve().parents[2]
         self.det_config_dir        = Path(det_config_dir) if det_config_dir else root_dir / 'configs' / "pp_ocrv6_small_det"
         self.rec_config_dir        = Path(rec_config_dir) if rec_config_dir else root_dir / 'configs' / "pp_ocrv6_small_rec"
         self.det_checkpoint_dir    = Path(det_checkpoint_dir) if det_checkpoint_dir else root_dir / "checkpoints" / "pp_ocrv6_small_det"

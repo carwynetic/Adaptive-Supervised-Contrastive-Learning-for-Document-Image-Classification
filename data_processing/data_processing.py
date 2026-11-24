@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 import random
@@ -245,3 +246,186 @@ def get_smooth_labels(
         idx = classes.index(val)
         targets[j, idx] = label_positive
     return targets
+
+
+class RVLCDIPCachedDataset(Dataset):
+    LABEL_NAMES: List[str] = RVLCDIPDataset.LABEL_NAMES
+
+    def __init__(
+        self,
+        data_dir: Union[Path, str],
+        split: str = "train",
+        transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+        is_contrastive: bool = False,
+        max_samples: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+        self.data_dir = Path(data_dir)
+        self.split = split
+        self.transform = transform
+        self.is_contrastive = is_contrastive
+
+        cache_path = self.data_dir / "ocr_cache" / f"{split}.jsonl"
+        if not cache_path.exists():
+            raise FileNotFoundError(f"Cached OCR file not found: {cache_path}")
+
+        all_records: List[Dict[str, Any]] = []
+        with open(cache_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                all_records.append(json.loads(line))
+
+        if max_samples is not None and len(all_records) > max_samples:
+            buckets: Dict[int, List[Dict[str, Any]]] = {}
+            for rec in all_records:
+                lbl = int(rec.get("label", 0))
+                buckets.setdefault(lbl, []).append(rec)
+            ordered_labels = sorted(buckets.keys())
+            selected: List[Dict[str, Any]] = []
+            max_len = max((len(buckets[l]) for l in ordered_labels), default=0)
+            for pos in range(max_len):
+                for lbl in ordered_labels:
+                    if pos < len(buckets[lbl]):
+                        selected.append(buckets[lbl][pos])
+                        if len(selected) >= max_samples:
+                            break
+                if len(selected) >= max_samples:
+                    break
+            self.records = selected
+        else:
+            self.records = all_records
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    @staticmethod
+    def _sanitize_words_and_boxes(
+        words: Sequence[str],
+        boxes: Sequence[Sequence[int]],
+    ) -> Tuple[List[str], List[List[int]]]:
+        clean_words: List[str] = []
+        clean_boxes: List[List[int]] = []
+        for w, b in zip(words, boxes):
+            w_str = str(w).strip()
+            if not w_str or len(b) < 4:
+                continue
+            x0 = max(0, min(1000, int(b[0])))
+            y0 = max(0, min(1000, int(b[1])))
+            x1 = max(x0, min(1000, int(b[2])))
+            y1 = max(y0, min(1000, int(b[3])))
+            clean_words.append(w_str)
+            clean_boxes.append([x0, y0, x1, y1])
+        if not clean_words:
+            clean_words = ["empty"]
+            clean_boxes = [[0, 0, 1000, 1000]]
+        return clean_words, clean_boxes
+
+    def _resolve_image_path(self, rel_or_abs: str) -> Path:
+        p = Path(rel_or_abs)
+        if p.is_absolute() and p.exists():
+            return p
+        return self.data_dir / p
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        rec = self.records[idx]
+        img_path = self._resolve_image_path(rec["image_path"])
+        tensor_img = read_image(img_path)
+        words, boxes = self._sanitize_words_and_boxes(rec.get("words", []), rec.get("boxes", []))
+        label = int(rec["label"])
+
+        if self.is_contrastive:
+            v1_t = self.transform(tensor_img) if self.transform is not None else tensor_img.clone()
+            v2_t = self.transform(tensor_img) if self.transform is not None else tensor_img.clone()
+            return {
+                "views": (TF.to_pil_image(v1_t).convert("RGB"), TF.to_pil_image(v2_t).convert("RGB")),
+                "words": words,
+                "boxes": boxes,
+                "label": label,
+                "image_path": str(img_path),
+            }
+
+        img_t = self.transform(tensor_img) if self.transform is not None else tensor_img
+        return {
+            "image": TF.to_pil_image(img_t).convert("RGB"),
+            "words": words,
+            "boxes": boxes,
+            "label": label,
+            "image_path": str(img_path),
+        }
+
+
+class MultimodalCollator:
+    def __init__(
+        self,
+        processor: Optional[Any] = None,
+        config_dir: Optional[Union[str, Path]] = None,
+        max_length: int = 512,
+    ) -> None:
+        self.max_length = max_length
+        if processor is not None:
+            self.processor = processor
+        else:
+            default_cfg = (
+                Path(config_dir)
+                if config_dir is not None
+                else Path(__file__).resolve().parents[1] / "configs" / "layoutlmv3-base"
+            )
+            try:
+                from third_party.layoutlmv3 import LayoutLMv3Processor
+            except ImportError:
+                from transformers import LayoutLMv3Processor
+            self.processor = LayoutLMv3Processor.from_pretrained(
+                str(default_cfg),
+                apply_ocr=False,
+                local_files_only=True,
+            )
+
+    def _encode_view(
+        self,
+        images: List[Image.Image],
+        words_list: List[List[str]],
+        boxes_list: List[List[List[int]]],
+    ) -> Dict[str, torch.Tensor]:
+        enc = self.processor(
+            images=images,
+            text=words_list,
+            boxes=boxes_list,
+            padding=True,
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+        )
+        return {
+            "input_ids": enc["input_ids"],
+            "attention_mask": enc["attention_mask"],
+            "bbox": enc["bbox"],
+            "pixel_values": enc["pixel_values"],
+        }
+
+    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+        batch = [item for item in batch if item]
+        if not batch:
+            return {}
+
+        labels = torch.tensor([int(item["label"]) for item in batch], dtype=torch.long)
+        words_list = [item["words"] for item in batch]
+        boxes_list = [item["boxes"] for item in batch]
+        image_paths = [item.get("image_path", "") for item in batch]
+
+        if "views" in batch[0]:
+            v1_imgs = [item["views"][0] for item in batch]
+            v2_imgs = [item["views"][1] for item in batch]
+            return {
+                "view1": self._encode_view(v1_imgs, words_list, boxes_list),
+                "view2": self._encode_view(v2_imgs, words_list, boxes_list),
+                "labels": labels,
+                "image_paths": image_paths,
+            }
+
+        imgs = [item["image"] for item in batch]
+        out = self._encode_view(imgs, words_list, boxes_list)
+        out["labels"] = labels
+        out["image_paths"] = image_paths
+        return out

@@ -28,10 +28,10 @@ from model.modules.projector import SupConProjector
 
 @dataclass 
 class DICOutput:
-    logits_dict     : Dict[int, torch.Tensor]                   # logits của các layer exit -> Logits [B, num_classes]
-    final_logits    : torch.Tensor                              # Logits [B, num_classes] tại tầng cuối cùng
-    projections_dict: Optional[Dict[int , torch.Tensor]] = None # layer -> Vector chiếu [B, projection_dim] (L2-norm)
-    cls_tokens_dict : Optional[Dict[int, torch.Tensor]] = None  # layer -> Vector [CLS] [B, 768] 
+    logits_dict     : Dict[int, torch.Tensor]
+    final_logits    : Optional[torch.Tensor] = None
+    projections_dict: Optional[Dict[int , torch.Tensor]] = None
+    cls_tokens_dict : Optional[Dict[int, torch.Tensor]] = None
 
 class DICWithoutGroupwise(nn.Module):
     """
@@ -105,21 +105,8 @@ class DICWithoutGroupwise(nn.Module):
         pixel_values: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         compute_projections: bool = True,
+        compute_logits: bool = True,
     ) -> DICOutput:
-        """
-        Forward pass của kiến trúc mô hình.
-
-        Args:
-            input_ids: Tensor token IDs (B, L)
-            bbox: Tensor bounding box chuẩn hóa [0, 1000] (B, L, 4)
-            pixel_values: Tensor ảnh tài liệu (B, 3, 224, 224)
-            attention_mask: Tensor mặt nạ padding (B, L)
-            compute_projections: Cờ bật/tắt tính toán vector chiếu SupCon (tiết kiệm tính toán khi suy luận).
-        
-        Returns:
-            DICOutput: Chứa logits_dict, final_logits, projections_dict, cls_tokens_dict.
-        """
-
         if self.is_encoder_frozen:
             with torch.no_grad():
                 backbone_out = self.backbone(
@@ -141,21 +128,22 @@ class DICWithoutGroupwise(nn.Module):
         logits_dict: Dict[int, torch.Tensor] = {}
         projections_dict: Optional[Dict[int, torch.Tensor]] = {} if compute_projections else None
         cls_tokens_dict: Dict[int, torch.Tensor] = {}
-        
+
         for layer in self.exit_layers:
-            cls_token = self.backbone.extract_cls_at_layer(hidden_states, layer)
+            if layer == 0:
+                cls_token = hidden_states[0].mean(dim=1)
+            else:
+                cls_token = self.backbone.extract_cls_at_layer(hidden_states, layer)
             cls_tokens_dict[layer] = cls_token
 
-            # Logits phân loại tại tầng này
-            logits = self.exit_heads[str(layer)](cls_token)
-            logits_dict[layer] = logits
+            if compute_logits:
+                logits_dict[layer] = self.exit_heads[str(layer)](cls_token)
 
-            # Vector chiếu tương phản (chuẩn hóa L2 lên siêu cầu)
             if compute_projections and projections_dict is not None:
-               projections_dict[layer] = self.projection_heads[str(layer)](cls_token)
+                projections_dict[layer] = self.projection_heads[str(layer)](cls_token)
 
         final_layer = self.exit_layers[-1]
-        final_logits = logits_dict[final_layer]
+        final_logits = logits_dict.get(final_layer) if compute_logits else None
 
         return DICOutput(
             logits_dict=logits_dict,

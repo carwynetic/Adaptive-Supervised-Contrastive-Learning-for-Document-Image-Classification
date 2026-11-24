@@ -61,7 +61,7 @@ class DICTrainer:
         self.num_classes = num_classes
         self.smoothing_coeff = smoothing_coeff
         self.grad_accum_steps = max(1, gradient_accumulation_steps)
-        self.use_amp = use_amp and torch.cuda.is_available()
+        self.use_amp = use_amp and self.device.type == "cuda"
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
 
         # Định nghĩa các nhóm tầng cho groupwise
@@ -111,7 +111,13 @@ class DICTrainer:
         base_optimizer = torch.optim.AdamW(stage1_params, lr=lr, weight_decay=weight_decay)
 
         optimizer = LARSWrapper(base_optimizer, eta=0.02, clip=True) if use_lars else base_optimizer
-        scheduler = LinearWarmupCosineAnnealingLR(optimizer, warmup_epochs=warmup_epochs, max_epochs=epochs)
+        warmup_start_lr = max(1e-7, lr * 0.1) if warmup_epochs > 1 else lr
+        scheduler = LinearWarmupCosineAnnealingLR(
+            optimizer,
+            warmup_epochs=warmup_epochs,
+            max_epochs=epochs,
+            warmup_start_lr=warmup_start_lr,
+        )
 
         for epoch in range(1, epochs + 1):
             total_epoch_loss = 0.0
@@ -195,6 +201,8 @@ class DICTrainer:
         # 1. Đóng băng Backbone Encoder
         self.model.freeze_encoder()
         self.model.train()
+        if getattr(self.model, "is_encoder_frozen", False) and hasattr(self.model, "backbone"):
+            self.model.backbone.eval()
 
         # 2. Optimizer chỉ tối ưu các tham số của exit_heads
         head_params = [p for p in self.model.exit_heads.parameters() if p.requires_grad]
@@ -285,6 +293,8 @@ class DICTrainer:
         print(f"  [Validation Accuracy] -> {acc_str}")
 
         self.model.train()
+        if getattr(self.model, "is_encoder_frozen", False) and hasattr(self.model, "backbone"):
+            self.model.backbone.eval()
         return accuracies
 
     # ==========================================================================
