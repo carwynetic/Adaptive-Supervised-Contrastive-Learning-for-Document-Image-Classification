@@ -34,14 +34,14 @@ class SupConLoss(nn.Module):
     """
     def __init__(
         self,
-        temperature: float = 0.07,
+        temperature: float = 0.1,
         contrast_mode: str = "all",
-        base_temperature: float = 0.07,
+        base_temperature: Optional[float] = None,
     ) -> None:
         super().__init__()
         self.temperature = temperature
         self.contrast_mode = contrast_mode
-        self.base_temperature = base_temperature
+        self.base_temperature = temperature if base_temperature is None else base_temperature
         
 
     def forward(
@@ -170,13 +170,17 @@ class MultiExitSupConLoss(nn.Module):
 
     def __init__(
         self,
-        exit_layers: Sequence[int] = (1, 4, 8, 10, 12),
-        temperature: float = 0.07,
+        exit_layers: Sequence[int] = (0, 1, 4, 8, 10, 12),
+        temperature: float = 0.1,
+        base_temperature: Optional[float] = None,
         default_weights: Optional[Dict[int, float]] = None,
     ) -> None:
         super().__init__()
         self.exit_layers = tuple(sorted(exit_layers))
-        self.supcon = SupConLoss(temperature=temperature)
+        self.supcon = SupConLoss(
+            temperature=temperature,
+            base_temperature=temperature if base_temperature is None else base_temperature,
+        )
 
         if default_weights is not None:
             total_w = sum(default_weights.values())
@@ -244,7 +248,7 @@ class MultiExitCELoss(nn.Module):
 
     def __init__(
         self,
-        exit_layers: Sequence[int] = (1, 4, 8, 10, 12),
+        exit_layers: Sequence[int] = (0, 1, 4, 8, 10, 12),
         label_smoothing: float = 0.0,
         default_weights: Optional[Dict[int, float]] = None,
     ) -> None:
@@ -318,7 +322,7 @@ if __name__ == "__main__":
     num_views = 2
     dim = 128
     num_classes = 16
-    exit_layers = (1, 4, 8, 10, 12)
+    exit_layers = (0, 1, 4, 8, 10, 12)
 
     hard_labels = torch.tensor([0, 0, 1, 15], dtype=torch.long, device=device)
     soft_targets = get_smooth_labels(hard_labels, classid_list=num_classes, smoothing_coeff=0.1).to(device)

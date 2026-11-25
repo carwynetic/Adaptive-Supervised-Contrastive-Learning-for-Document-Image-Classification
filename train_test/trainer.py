@@ -22,6 +22,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from data_processing import get_smooth_labels
+from utils.config import build_adamw_param_groups
 from utils.lars_wrapper import LARSWrapper
 from utils.losses import MultiExitCELoss, MultiExitSupConLoss
 from utils.schedulers import LinearWarmupCosineAnnealingLR
@@ -32,26 +33,30 @@ class DICTrainer:
         self,
         model: nn.Module,
         train_type: str = "without_groupwise",
-        exit_layers: Sequence[int] = (1, 4, 8, 10, 12),
+        exit_layers: Sequence[int] = (0, 1, 4, 8, 10, 12),
         groups: Optional[Dict[str, Sequence[int]]] = None,
         num_classes: int = 16,
         smoothing_coeff: float = 0.1,
         temperature: float = 0.1,
+        base_temperature: Optional[float] = None,
+        label_smoothing_stage2: float = 0.1,
         device: Optional[Union[str, torch.device]] = None,
-        gradient_accumulation_steps: int = 4,
+        gradient_accumulation_steps: int = 2,
         use_amp: bool = True,
     ) -> None:
         """
         Args:
             model: Mô hình DIC (DICWithoutGroupwise hoặc DIC).
             train_type: 'without_groupwise' hoặc 'groupwise'.
-            exit_layers: Danh sách tầng exit [1, 4, 8, 10, 12].
-            groups: Cấu hình phân nhóm cho groupwise (mặc định: g1=[1,4], g2=[8,10,12]).
+            exit_layers: Danh sách tầng exit [0, 1, 4, 8, 10, 12].
+            groups: Cấu hình phân nhóm cho groupwise (mặc định: g1=[0,1,4], g2=[8,10,12]).
             num_classes: Số lượng lớp (16 cho RVL-CDIP).
-            smoothing_coeff: Hệ số làm mịn nhãn mềm ConOSR (epsilon=0.1).
+            smoothing_coeff: Hệ số làm mịn nhãn mềm ConOSR Stage 1 (epsilon=0.1).
             temperature: Tham số nhiệt độ tau cho SupCon-ST.
+            base_temperature: Nhiệt độ chuẩn hóa của SupCon-ST (mặc định bằng temperature theo ConOSR).
+            label_smoothing_stage2: Hệ số label smoothing cho CE ở Stage 2 (mặc định 0.1 theo ConOSR Step 2).
             device: 'cuda' hoặc 'cpu'.
-            gradient_accumulation_steps: Số bước tích lũy gradient (mô phỏng large batch size).
+            gradient_accumulation_steps: Số bước tích lũy gradient.
             use_amp: Bật/tắt Mixed Precision (float16/bfloat16).
         """
         self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -74,8 +79,15 @@ class DICTrainer:
             self.groups = {k: tuple(v) for k, v in groups.items()}
 
         # Khởi tạo 2 hàm mất mát đa tầng
-        self.supcon_criterion = MultiExitSupConLoss(exit_layers=self.exit_layers, temperature=temperature).to(self.device)
-        self.ce_criterion = MultiExitCELoss(exit_layers=self.exit_layers).to(self.device)
+        self.supcon_criterion = MultiExitSupConLoss(
+            exit_layers=self.exit_layers,
+            temperature=temperature,
+            base_temperature=temperature if base_temperature is None else base_temperature,
+        ).to(self.device)
+        self.ce_criterion = MultiExitCELoss(
+            exit_layers=self.exit_layers,
+            label_smoothing=label_smoothing_stage2,
+        ).to(self.device)
 
         print(f"[+] Khởi tạo DICTrainer trên thiết bị: {self.device}")
         print(f"[+] Kiểu huấn luyện (train_type): {self.train_type}")
@@ -89,15 +101,20 @@ class DICTrainer:
     def train_stage1(
         self,
         train_loader: DataLoader,
-        epochs: int = 10,
-        lr: float = 1e-4,
+        epochs: int = 30,
+        lr: float = 5e-5,
         weight_decay: float = 1e-4,
-        warmup_epochs: int = 2,
-        use_lars: bool = True,
+        warmup_epochs: int = 3,
+        warmup_start_lr_ratio: float = 0.1,
+        eta_min: float = 0.0,
+        use_lars: bool = False,
+        lars_eta: float = 0.02,
+        exclude_bias_norm: bool = True,
+        max_grad_norm: float = 1.0,
         save_dir: Optional[str] = None,
     ) -> None:
         """
-        Giai đoạn 1: Huấn luyện biểu diễn tương phản đa tầng (SupCon-ST).
+        Giai đoạn 1: Huấn luyện biểu diễn tương phản đa tầng (SupCon-ST, không Mixup).
         """
         print("\n" + "=" * 65)
         print(f"BẮT ĐẦU STAGE 1: TƯƠNG PHẢN ĐA TẦNG (SUPCON-ST) - {epochs} EPOCHS")
@@ -106,17 +123,28 @@ class DICTrainer:
         self.model.unfreeze_encoder()
         self.model.train()
 
-        # 1. Optimizer cho Stage 1: Cập nhật Backbone + 5 Projection Heads
-        stage1_params = [p for p in self.model.parameters() if p.requires_grad]
-        base_optimizer = torch.optim.AdamW(stage1_params, lr=lr, weight_decay=weight_decay)
+        # 1. Optimizer cho Stage 1: Cập nhật Backbone + Projection Heads (tách nhóm bias/LayerNorm)
+        stage1_named_params = [
+            (n, p)
+            for n, p in self.model.named_parameters()
+            if p.requires_grad and not n.startswith("exit_heads.")
+        ]
+        stage1_params = [p for _, p in stage1_named_params]
+        param_groups = build_adamw_param_groups(
+            stage1_named_params,
+            weight_decay=weight_decay,
+            exclude_bias_norm=exclude_bias_norm,
+        )
+        base_optimizer = torch.optim.AdamW(param_groups, lr=lr)
 
-        optimizer = LARSWrapper(base_optimizer, eta=0.02, clip=True) if use_lars else base_optimizer
-        warmup_start_lr = max(1e-7, lr * 0.1) if warmup_epochs > 1 else lr
+        optimizer = LARSWrapper(base_optimizer, eta=lars_eta, clip=True) if use_lars else base_optimizer
+        warmup_start_lr = max(1e-7, lr * warmup_start_lr_ratio) if warmup_epochs > 1 else lr
         scheduler = LinearWarmupCosineAnnealingLR(
             optimizer,
             warmup_epochs=warmup_epochs,
             max_epochs=epochs,
             warmup_start_lr=warmup_start_lr,
+            eta_min=eta_min,
         )
 
         for epoch in range(1, epochs + 1):
@@ -165,6 +193,9 @@ class DICTrainer:
 
                 # Cập nhật trọng số theo chu kỳ tích lũy gradient
                 if step % self.grad_accum_steps == 0 or step == len(train_loader):
+                    self.scaler.unscale_(optimizer)
+                    if max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(stage1_params, max_grad_norm)
                     self.scaler.step(optimizer)
                     self.scaler.update()
                     optimizer.zero_grad()
@@ -186,17 +217,21 @@ class DICTrainer:
         self,
         train_loader: DataLoader,
         val_loader: Optional[DataLoader] = None,
-        epochs: int = 10,
+        epochs: int = 20,
         lr: float = 3e-4,
-        weight_decay: float = 1e-2,
+        weight_decay: float = 0.0,
+        eta_min: float = 0.0,
+        gradient_accumulation_steps: Optional[int] = None,
         save_dir: Optional[str] = None,
     ) -> None:
         """
-        Giai đoạn 2: Đóng băng Backbone Encoder, chỉ huấn luyện 5 nhánh phân loại Exit.
+        Giai đoạn 2: Đóng băng Backbone Encoder, chỉ huấn luyện 6 nhánh phân loại Exit.
         """
         print("\n" + "=" * 65)
         print(f"BẮT ĐẦU STAGE 2: HUẤN LUYỆN BỘ PHÂN LOẠI (CE LOSS) - {epochs} EPOCHS")
         print("=" * 65)
+
+        accum_steps = max(1, gradient_accumulation_steps) if gradient_accumulation_steps is not None else self.grad_accum_steps
 
         # 1. Đóng băng Backbone Encoder
         self.model.freeze_encoder()
@@ -207,7 +242,7 @@ class DICTrainer:
         # 2. Optimizer chỉ tối ưu các tham số của exit_heads
         head_params = [p for p in self.model.exit_heads.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(head_params, lr=lr, weight_decay=weight_decay)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs), eta_min=eta_min)
 
         best_acc = 0.0
 
@@ -227,7 +262,7 @@ class DICTrainer:
                 # Điều phối Backward pass theo train_type
                 if self.train_type == "without_groupwise":
                     total_loss = self.ce_criterion.compute_total_loss(layer_losses)
-                    loss_to_backward = total_loss / self.grad_accum_steps
+                    loss_to_backward = total_loss / accum_steps
                     self.scaler.scale(loss_to_backward).backward()
                     step_loss_val = total_loss.item()
                 else:
@@ -235,7 +270,7 @@ class DICTrainer:
                     group_loss_vals = []
                     for i, (g_name, g_layers) in enumerate(self.groups.items()):
                         g_loss = sum(layer_losses[l] for l in g_layers)
-                        loss_to_backward = g_loss / self.grad_accum_steps
+                        loss_to_backward = g_loss / accum_steps
                         is_last_group = (i == len(self.groups) - 1)
                         self.scaler.scale(loss_to_backward).backward(retain_graph=not is_last_group)
                         group_loss_vals.append(g_loss.item())
@@ -243,7 +278,7 @@ class DICTrainer:
 
                 total_epoch_loss += step_loss_val
 
-                if step % self.grad_accum_steps == 0 or step == len(train_loader):
+                if step % accum_steps == 0 or step == len(train_loader):
                     self.scaler.step(optimizer)
                     self.scaler.update()
                     optimizer.zero_grad()
@@ -354,7 +389,7 @@ if __name__ == "__main__":
     print(f"Target Device: {device}")
 
     # 1. Khởi tạo mô hình
-    exit_layers = (1, 4, 8, 10, 12)
+    exit_layers = (0, 1, 4, 8, 10, 12)
     model = DICWithoutGroupwise(num_classes=16, exit_layers=exit_layers).to(device)
 
     # 2. Khởi tạo Trainer với mode 'without_groupwise'

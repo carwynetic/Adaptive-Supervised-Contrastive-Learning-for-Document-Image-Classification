@@ -35,7 +35,7 @@ class EarlyExitEvaluator:
     def __init__(
         self,
         model: nn.Module,
-        exit_layers: Sequence[int] = (1, 4, 8, 10, 12),
+        exit_layers: Sequence[int] = (0, 1, 4, 8, 10, 12),
         device: Optional[Union[str, torch.device]] = None,
     ) -> None:
         self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -248,7 +248,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint_path", type=str, default="checkpoints/run_01/best_model.pt", help="Đường dẫn file .pt")
     parser.add_argument("--data_dir", type=str, default="data/rvl-cdip", help="Đường dẫn thư mục tập dữ liệu")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size khi đánh giá")
-    parser.add_argument("--exit_layers", type=int, nargs="+", default=[1, 4, 8, 10, 12])
+    parser.add_argument("--exit_layers", type=int, nargs="+", default=[0, 1, 4, 8, 10, 12])
     parser.add_argument("--criterion", type=str, default="max_confidence", choices=["max_confidence", "entropy", "top12_margin"])
     parser.add_argument("--threshold", type=float, default=0.8, help="Ngưỡng tự tin cố định")
     parser.add_argument("--sweep", action="store_true", help="Bật chế độ quét dải ngưỡng để vẽ Trade-off curve")

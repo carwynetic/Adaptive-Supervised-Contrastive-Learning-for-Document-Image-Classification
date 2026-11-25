@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader
 
 from data_processing.data_processing import (
     MultimodalCollator,
+    PKBatchSampler,
     RVLCDIPCachedDataset,
     get_smooth_labels,
     get_transforms,
@@ -23,6 +24,7 @@ from data_processing.data_processing import (
 from model.DIC_without_groupwise import DICWithoutGroupwise
 from model.modules.ee_modules import ExitConfig, compute_ece
 from model.modules.layoutlmv3 import LayoutLMv3EEForSequenceClassification
+from utils.config import build_adamw_param_groups
 from utils.gradient_conflict import (
     GradientConflictProber,
     compute_2d_loss_landscape,
@@ -81,6 +83,7 @@ def _count_subgraph_params(model: nn.Module, exit_layer: int) -> int:
     return max(1, total)
 
 
+# Source: Subgraph weighting Eq. (2) in Hamed et al. (ICDAR 2024, arXiv:2405.12705) & params_per_exit/EETrainer in https://github.com/Jordy-VL/multi-modal-early-exit/blob/main/EE/models/EE_modules.py
 def compute_exit_weights(
     model: nn.Module,
     exit_layers: Sequence[int],
@@ -97,14 +100,21 @@ def compute_exit_weights(
     inv_counts = {l: 1.0 / float(_count_subgraph_params(model, l)) for l in sorted_layers}
 
     if weighting_mode == "subgraph_paper":
-        denom = sum(inv_counts.values())
-        return {l: inv_counts[l] / denom for l in sorted_layers}
+        early_layers = sorted_layers[:-1]
+        final_layer = sorted_layers[-1]
+        early_denom = sum(inv_counts[l] for l in early_layers) or 1.0
+        weights: Dict[int, float] = {}
+        for l in early_layers:
+            w_sub = inv_counts[l] / early_denom
+            weights[l] = gamma * w_sub if gamma != 0.0 else w_sub
+        weights[final_layer] = (1.0 - gamma) if gamma != 0.0 else 1.0
+        return weights
 
     if weighting_mode == "subgraph_repo":
         early_layers = sorted_layers[:-1]
         final_layer = sorted_layers[-1]
         early_denom = sum(inv_counts[l] for l in early_layers) or 1.0
-        weights: Dict[int, float] = {}
+        weights = {}
         num_early = len(early_layers)
         for l in early_layers:
             w_sub = inv_counts[l] / early_denom
@@ -115,19 +125,39 @@ def compute_exit_weights(
     raise ValueError(f"Unsupported weighting_mode: {weighting_mode}")
 
 
-def _build_cosine_warmup_scheduler(
+def _build_linear_warmup_scheduler(
     optimizer: Any,
     total_steps: int,
-    warmup_ratio: float = 0.1,
+    warmup_ratio: float = 0.0,
 ) -> torch.optim.lr_scheduler.LambdaLR:
-    warmup_steps = max(1, int(total_steps * warmup_ratio)) if total_steps > 1 else 0
+    warmup_steps = int(total_steps * warmup_ratio) if warmup_ratio > 0.0 and total_steps > 1 else 0
 
     def _lr_lambda(current_step: int) -> float:
         if warmup_steps > 0 and current_step < warmup_steps:
             return float(current_step + 1) / float(warmup_steps)
+        denom = float(max(1, total_steps - warmup_steps))
+        return max(0.0, float(total_steps - current_step) / denom)
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
+
+
+def _build_cosine_warmup_scheduler(
+    optimizer: Any,
+    total_steps: int,
+    warmup_ratio: float = 0.1,
+    warmup_start_lr_ratio: float = 0.1,
+    eta_min_ratio: float = 0.0,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    warmup_steps = int(total_steps * warmup_ratio) if warmup_ratio > 0.0 and total_steps > 1 else 0
+
+    def _lr_lambda(current_step: int) -> float:
+        if warmup_steps > 0 and current_step < warmup_steps:
+            frac = float(current_step + 1) / float(warmup_steps)
+            return warmup_start_lr_ratio + (1.0 - warmup_start_lr_ratio) * frac
         progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
         progress = min(1.0, max(0.0, progress))
-        return max(0.05, 0.5 * (1.0 + math.cos(math.pi * progress)))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return eta_min_ratio + (1.0 - eta_min_ratio) * cosine
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
 
@@ -194,10 +224,16 @@ def _build_loaders(
     dry_run: bool,
     num_classes: int,
     seed: int,
+    eval_batch_size: Optional[int] = None,
+    sampler_type: str = "random",
+    pk_p: int = 4,
+    pk_k: int = 2,
+    transform: Optional[Any] = None,
 ) -> Tuple[Any, Any]:
+    val_bs = eval_batch_size if eval_batch_size is not None else batch_size
     if dry_run:
         n_train = max(batch_size * 2, min(max_samples or 4, 8))
-        n_val = max(batch_size, min(max_samples or 4, 4))
+        n_val = max(val_bs, min(max_samples or 4, 4))
         train_loader = _create_synthetic_batches(
             num_samples=n_train,
             batch_size=batch_size,
@@ -207,7 +243,7 @@ def _build_loaders(
         )
         val_loader = _create_synthetic_batches(
             num_samples=n_val,
-            batch_size=batch_size,
+            batch_size=val_bs,
             num_classes=num_classes,
             is_contrastive=is_contrastive,
             seed=seed + 100,
@@ -215,7 +251,8 @@ def _build_loaders(
         return train_loader, val_loader
 
     collator = MultimodalCollator(max_length=512)
-    train_tf = get_transforms() if is_contrastive else None
+    train_tf = transform if transform is not None else (get_transforms() if is_contrastive else None)
+    val_tf = train_tf if is_contrastive else None
     train_ds = RVLCDIPCachedDataset(
         data_dir=data_dir,
         split="train",
@@ -226,23 +263,34 @@ def _build_loaders(
     val_ds = RVLCDIPCachedDataset(
         data_dir=data_dir,
         split="val",
-        transform=train_tf if is_contrastive else None,
+        transform=val_tf,
         is_contrastive=is_contrastive,
         max_samples=max_samples,
     )
     pin = torch.cuda.is_available()
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        collate_fn=collator,
-        pin_memory=pin,
-        drop_last=is_contrastive and len(train_ds) >= batch_size,
-    )
+    if sampler_type == "pk" and len(train_ds) > 0:
+        train_labels = [int(r["label"]) for r in train_ds.records]
+        batch_sampler = PKBatchSampler(train_labels, p=pk_p, k=pk_k, seed=seed)
+        train_loader = DataLoader(
+            train_ds,
+            batch_sampler=batch_sampler,
+            num_workers=num_workers,
+            collate_fn=collator,
+            pin_memory=pin,
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            collate_fn=collator,
+            pin_memory=pin,
+            drop_last=is_contrastive and len(train_ds) >= batch_size,
+        )
     val_loader = DataLoader(
         val_ds,
-        batch_size=batch_size,
+        batch_size=val_bs,
         shuffle=False,
         num_workers=num_workers,
         collate_fn=collator,
@@ -338,19 +386,23 @@ def _evaluate_dic_model(
     return {"accuracy": per_exit_acc, "ece": per_exit_ece}
 
 
+# Source: Baseline EE training (one_stage_subgraphs_weighted, AdamW, max_confidence) from https://github.com/Jordy-VL/multi-modal-early-exit/blob/main/EE/configs.py & https://github.com/Jordy-VL/multi-modal-early-exit/blob/main/EE/IC_only.py
 def run_exp1_hamed_ce(
     data_dir: Union[str, Path],
     output_dir: Union[str, Path],
-    exit_layers: Sequence[int] = (0, 1, 4, 8, 12),
+    exit_layers: Sequence[int] = (0, 1, 4, 8, 10, 12),
     num_classes: int = 16,
-    weighting_mode: str = "subgraph_paper",
+    weighting_mode: str = "subgraph_repo",
     gamma: float = 0.5,
     batch_size: int = 2,
-    grad_accum_steps: int = 8,
-    epochs: int = 5,
-    lr: float = 5e-5,
-    weight_decay: float = 0.01,
-    warmup_ratio: float = 0.1,
+    eval_batch_size: int = 1,
+    grad_accum_steps: int = 1,
+    epochs: int = 20,
+    lr: float = 1e-4,
+    weight_decay: float = 0.0,
+    warmup_ratio: float = 0.0,
+    scheduler_type: str = "linear",
+    max_grad_norm: float = 1.0,
     probe_every_n_steps: int = 10,
     landscape_grid_size: int = 11,
     landscape_span: float = 0.5,
@@ -408,6 +460,7 @@ def run_exp1_hamed_ce(
     train_loader, val_loader = _build_loaders(
         data_dir=data_dir,
         batch_size=batch_size,
+        eval_batch_size=eval_batch_size,
         num_workers=num_workers,
         is_contrastive=False,
         max_samples=max_samples,
@@ -419,7 +472,13 @@ def run_exp1_hamed_ce(
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp and dev.type == "cuda" and amp_dt == torch.float16)
     steps_per_epoch = max(1, math.ceil(len(train_loader) / max(1, grad_accum_steps)))
-    scheduler = _build_cosine_warmup_scheduler(optimizer, total_steps=steps_per_epoch * epochs, warmup_ratio=warmup_ratio)
+    total_steps = steps_per_epoch * epochs
+    if scheduler_type == "linear":
+        scheduler = _build_linear_warmup_scheduler(optimizer, total_steps=total_steps, warmup_ratio=warmup_ratio)
+    elif scheduler_type in ("cosine", "warmup_cosine"):
+        scheduler = _build_cosine_warmup_scheduler(optimizer, total_steps=total_steps, warmup_ratio=warmup_ratio)
+    else:
+        raise ValueError(f"Unsupported scheduler_type: {scheduler_type}")
 
     if dev.type == "cuda":
         torch.cuda.reset_peak_memory_stats(dev)
@@ -462,7 +521,8 @@ def run_exp1_hamed_ce(
 
             if step_idx % max(1, grad_accum_steps) == 0 or step_idx == len(train_loader):
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                if max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 scaler.step(optimizer)
                 scaler.update()
                 scheduler.step()
@@ -530,10 +590,14 @@ def run_exp1_hamed_ce(
             "exit_weights": {str(k): v for k, v in exit_weights.items()},
             "gamma": gamma,
             "batch_size": batch_size,
+            "eval_batch_size": eval_batch_size,
             "grad_accum_steps": grad_accum_steps,
             "epochs": epochs,
             "lr": lr,
             "weight_decay": weight_decay,
+            "warmup_ratio": warmup_ratio,
+            "scheduler_type": scheduler_type,
+            "max_grad_norm": max_grad_norm,
             "seed": seed,
             "dry_run": dry_run,
         },
@@ -555,24 +619,46 @@ def run_exp1_hamed_ce(
     return payload
 
 
+# Source: Stage 1 (SimCLR arXiv:2002.05709 + ConOSR AAAI 2023 SupCon-ST without Mixup) & Stage 2 (ConOSR Step 2 Classifier + SimCLR Linear Eval)
 def run_exp2_supcon(
     data_dir: Union[str, Path],
     output_dir: Union[str, Path],
-    exit_layers: Sequence[int] = (0, 1, 4, 8, 12),
+    exit_layers: Sequence[int] = (0, 1, 4, 8, 10, 12),
     num_classes: int = 16,
     weighting_mode: str = "uniform",
     gamma: float = 0.5,
-    batch_size: int = 2,
-    grad_accum_steps: int = 8,
-    epochs: int = 5,
-    epochs_stage2: int = 5,
+    batch_size: int = 4,
+    grad_accum_steps: int = 4,
+    sampler: str = "pk",
+    pk_p: int = 2,
+    pk_k: int = 2,
+    epochs: int = 30,
     lr: float = 5e-5,
-    lr_stage2: float = 3e-4,
-    weight_decay: float = 0.01,
+    weight_decay: float = 1e-4,
+    exclude_bias_norm: bool = True,
     warmup_ratio: float = 0.1,
+    warmup_start_lr_ratio: float = 0.1,
+    eta_min_ratio: float = 0.0,
     temperature: float = 0.1,
+    base_temperature: Optional[float] = None,
     smoothing_coeff: float = 0.1,
     use_lars: bool = False,
+    lars_eta: float = 0.02,
+    max_grad_norm: float = 1.0,
+    max_shear: float = 4.0,
+    brightness_range: Tuple[float, float] = (0.8, 1.2),
+    p_blur: float = 0.5,
+    blur_sigma: Tuple[float, float] = (0.1, 2.0),
+    noise_std: float = 8.0,
+    p_erase: float = 0.3,
+    epochs_stage2: int = 20,
+    batch_size_stage2: Optional[int] = None,
+    eval_batch_size: int = 1,
+    grad_accum_steps_stage2: int = 1,
+    lr_stage2: float = 3e-4,
+    weight_decay_stage2: float = 0.0,
+    label_smoothing_stage2: float = 0.1,
+    use_aug_stage2: bool = True,
     probe_every_n_steps: int = 10,
     landscape_grid_size: int = 11,
     landscape_span: float = 0.5,
@@ -614,29 +700,63 @@ def run_exp2_supcon(
     probe_groups = extract_shared_layer_param_groups(model, probe_layers=probe_layers)
     prober = GradientConflictProber(probe_param_groups=probe_groups)
 
-    supcon_criterion = MultiExitSupConLoss(exit_layers=sorted_exits, temperature=temperature).to(dev)
-    ce_criterion = MultiExitCELoss(exit_layers=sorted_exits).to(dev)
+    resolved_base_temp = temperature if base_temperature is None else base_temperature
+    supcon_criterion = MultiExitSupConLoss(
+        exit_layers=sorted_exits,
+        temperature=temperature,
+        base_temperature=resolved_base_temp,
+    ).to(dev)
+    ce_criterion = MultiExitCELoss(
+        exit_layers=sorted_exits,
+        label_smoothing=label_smoothing_stage2,
+    ).to(dev)
+
+    aug_tf = get_transforms(
+        max_shear=max_shear,
+        brightness_range=brightness_range,
+        p_erase=p_erase,
+        noise_std=noise_std,
+        p_blur=p_blur,
+        blur_sigma=blur_sigma,
+    )
 
     train_loader_s1, val_loader_s1 = _build_loaders(
         data_dir=data_dir,
         batch_size=batch_size,
+        eval_batch_size=batch_size,
         num_workers=num_workers,
         is_contrastive=True,
         max_samples=max_samples,
         dry_run=dry_run,
         num_classes=num_classes,
         seed=seed,
+        sampler_type=sampler,
+        pk_p=pk_p,
+        pk_k=pk_k,
+        transform=aug_tf,
     )
 
-    stage1_params = list(model.backbone.parameters()) + list(model.projection_heads.parameters())
-    base_opt = torch.optim.AdamW(stage1_params, lr=lr, weight_decay=weight_decay)
-    optimizer = LARSWrapper(base_opt, eta=0.02, clip=True) if use_lars else base_opt
+    stage1_named_params = [
+        (f"backbone.{n}", p) for n, p in model.backbone.named_parameters()
+    ] + [
+        (f"projection_heads.{n}", p) for n, p in model.projection_heads.named_parameters()
+    ]
+    stage1_params = [p for _, p in stage1_named_params]
+    stage1_param_groups = build_adamw_param_groups(
+        stage1_named_params,
+        weight_decay=weight_decay,
+        exclude_bias_norm=exclude_bias_norm,
+    )
+    base_opt = torch.optim.AdamW(stage1_param_groups, lr=lr)
+    optimizer = LARSWrapper(base_opt, eta=lars_eta, clip=True) if use_lars else base_opt
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp and dev.type == "cuda" and amp_dt == torch.float16)
     steps_per_epoch = max(1, math.ceil(len(train_loader_s1) / max(1, grad_accum_steps)))
     scheduler = _build_cosine_warmup_scheduler(
         base_opt,
         total_steps=steps_per_epoch * epochs,
         warmup_ratio=warmup_ratio,
+        warmup_start_lr_ratio=warmup_start_lr_ratio,
+        eta_min_ratio=eta_min_ratio,
     )
 
     if dev.type == "cuda":
@@ -690,7 +810,8 @@ def run_exp2_supcon(
 
             if step_idx % max(1, grad_accum_steps) == 0 or step_idx == len(train_loader_s1):
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(stage1_params, 1.0)
+                if max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(stage1_params, max_grad_norm)
                 scaler.step(optimizer)
                 scaler.update()
                 scheduler.step()
@@ -748,25 +869,28 @@ def run_exp2_supcon(
     )
 
     stage2_logs: List[Dict[str, Any]] = []
+    bs2 = batch_size_stage2 if batch_size_stage2 is not None else batch_size
     if run_stage2_probe and epochs_stage2 > 0:
         train_loader_s2, val_loader_s2 = _build_loaders(
             data_dir=data_dir,
-            batch_size=batch_size,
+            batch_size=bs2,
+            eval_batch_size=eval_batch_size,
             num_workers=num_workers,
             is_contrastive=False,
             max_samples=max_samples,
             dry_run=dry_run,
             num_classes=num_classes,
             seed=seed,
+            transform=aug_tf if use_aug_stage2 else None,
         )
         model.freeze_encoder()
         model.train()
         model.backbone.eval()
 
         head_params = list(model.exit_heads.parameters())
-        opt2 = torch.optim.AdamW(head_params, lr=lr_stage2, weight_decay=weight_decay)
+        opt2 = torch.optim.AdamW(head_params, lr=lr_stage2, weight_decay=weight_decay_stage2)
         scaler2 = torch.amp.GradScaler("cuda", enabled=use_amp and dev.type == "cuda" and amp_dt == torch.float16)
-        sched2 = torch.optim.lr_scheduler.CosineAnnealingLR(opt2, T_max=max(1, epochs_stage2))
+        sched2 = torch.optim.lr_scheduler.CosineAnnealingLR(opt2, T_max=max(1, epochs_stage2), eta_min=0.0)
 
         for ep2 in range(1, epochs_stage2 + 1):
             opt2.zero_grad(set_to_none=True)
@@ -780,9 +904,9 @@ def run_exp2_supcon(
                     out = model(**inputs, compute_projections=False, compute_logits=True)
                     ce_dict = ce_criterion(out.logits_dict, labels)
                     ce_loss = ce_criterion.compute_total_loss(ce_dict)
-                scaler2.scale(ce_loss / float(max(1, grad_accum_steps))).backward()
+                scaler2.scale(ce_loss / float(max(1, grad_accum_steps_stage2))).backward()
                 tot_ce += float(ce_loss.detach().float().item())
-                if st2 % max(1, grad_accum_steps) == 0 or st2 == len(train_loader_s2):
+                if st2 % max(1, grad_accum_steps_stage2) == 0 or st2 == len(train_loader_s2):
                     scaler2.step(opt2)
                     scaler2.update()
                     opt2.zero_grad(set_to_none=True)
@@ -819,14 +943,27 @@ def run_exp2_supcon(
             "gamma": gamma,
             "batch_size": batch_size,
             "grad_accum_steps": grad_accum_steps,
+            "sampler": sampler,
+            "pk_p": pk_p,
+            "pk_k": pk_k,
             "epochs": epochs,
-            "epochs_stage2": epochs_stage2,
             "lr": lr,
-            "lr_stage2": lr_stage2,
             "weight_decay": weight_decay,
+            "exclude_bias_norm": exclude_bias_norm,
+            "warmup_ratio": warmup_ratio,
             "temperature": temperature,
+            "base_temperature": resolved_base_temp,
             "smoothing_coeff": smoothing_coeff,
             "use_lars": use_lars,
+            "lars_eta": lars_eta,
+            "epochs_stage2": epochs_stage2,
+            "batch_size_stage2": bs2,
+            "eval_batch_size": eval_batch_size,
+            "grad_accum_steps_stage2": grad_accum_steps_stage2,
+            "lr_stage2": lr_stage2,
+            "weight_decay_stage2": weight_decay_stage2,
+            "label_smoothing_stage2": label_smoothing_stage2,
+            "use_aug_stage2": use_aug_stage2,
             "seed": seed,
             "dry_run": dry_run,
         },

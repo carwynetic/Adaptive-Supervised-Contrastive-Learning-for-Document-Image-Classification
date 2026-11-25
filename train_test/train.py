@@ -44,8 +44,8 @@ def parse_args() -> argparse.Namespace:
         "--exit_layers",
         type=int,
         nargs="+",
-        default=[1, 4, 8, 10, 12],
-        help="Danh sách các tầng đặt exit (mặc định: 1 4 8 10 12)",
+        default=[0, 1, 4, 8, 10, 12],
+        help="Danh sách các tầng đặt exit (mặc định: 0 1 4 8 10 12)",
     )
     parser.add_argument(
         "--num_classes",

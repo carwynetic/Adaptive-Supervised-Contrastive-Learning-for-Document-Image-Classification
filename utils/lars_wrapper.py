@@ -62,6 +62,9 @@ class LARSWrapper(object):
             weight_decay = group.get('weight_decay', 0)
             weight_decays.append(weight_decay)
 
+            if group.get('exclude_from_lars', False):
+                continue
+
             # reset weight decay
             group['weight_decay'] = 0
 

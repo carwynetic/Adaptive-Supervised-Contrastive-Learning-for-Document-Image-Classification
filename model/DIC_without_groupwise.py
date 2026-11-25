@@ -41,7 +41,7 @@ class DICWithoutGroupwise(nn.Module):
     def __init__(
         self,
         num_classes: int = 16,
-        exit_layers: Sequence[int] = (1, 4, 8, 10, 12),
+        exit_layers: Sequence[int] = (0, 1, 4, 8, 10, 12),
         projection_dim: int = 128,
         config_dir: Optional[Union[str, Path]] = None,
         checkpoint_dir: Optional[Union[str, Path]] = None,
@@ -161,7 +161,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Target Device: {device}")
 
-    model = DICWithoutGroupwise(num_classes=16, exit_layers=(1, 4, 8, 10, 12)).to(device)
+    model = DICWithoutGroupwise(num_classes=16, exit_layers=(0, 1, 4, 8, 10, 12)).to(device)
     
     # Dữ liệu giả lập kiểm tra luồng tính toán
     batch_size = 2

@@ -57,7 +57,9 @@ _DEFAULT_CHECKPOINT_DIR = _PROJECT_ROOT / "checkpoints" / "layoutlmv3-base"
 
 
 # ==============================================================================
-# 1. Early-Exit Classification / Gate Head (Adapted from EE/models/LayoutLMv3.py)
+# 1. Early-Exit Classification / Gate Head
+# Source: https://github.com/Jordy-VL/multi-modal-early-exit/blob/main/EE/models/LayoutLMv3.py
+# Paper : Hamed et al. (ICDAR 2024, arXiv:2405.12705)
 # ==============================================================================
 
 class LayoutLMv3Exit(nn.Module):

@@ -8,7 +8,7 @@ import numpy as np
 from PIL import Image
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 from torchvision.transforms import functional as TF
 from torchvision.transforms import Compose
 # ==============================================================================
@@ -82,6 +82,85 @@ class GaussianNoise:
         return (img.float() + noise).clamp(0.0, 1.0).to(img.dtype)
 
 
+class RandomGaussianBlur:
+    """Random Gaussian Blur adapted from SimCLR Appendix A for document images."""
+
+    def __init__(self, p: float = 0.5, sigma: Tuple[float, float] = (0.1, 2.0)):
+        self.p = p
+        self.sigma = sigma
+
+    def __call__(self, img: torch.Tensor):
+        if self.p <= 0.0 or random.random() > self.p:
+            return img
+        _, h, w = img.shape
+        k = max(3, int(round(0.05 * min(h, w))))
+        if k % 2 == 0:
+            k += 1
+        k = min(k, 11)
+        sigma_val = random.uniform(self.sigma[0], self.sigma[1])
+        return TF.gaussian_blur(img, kernel_size=[k, k], sigma=[sigma_val, sigma_val])
+
+
+class PKBatchSampler(Sampler[List[int]]):
+    """Class-balanced P x K batch sampler ensuring positive and negative pairs per mini-batch."""
+
+    def __init__(
+        self,
+        labels: Sequence[int],
+        p: int = 4,
+        k: int = 2,
+        seed: int = 42,
+    ) -> None:
+        self.labels = [int(y) for y in labels]
+        self.class_to_indices: Dict[int, List[int]] = {}
+        for idx, lbl in enumerate(self.labels):
+            self.class_to_indices.setdefault(lbl, []).append(idx)
+        self.classes = sorted(self.class_to_indices.keys())
+        self.p = max(1, min(int(p), len(self.classes))) if self.classes else 1
+        self.k = max(1, int(k))
+        self.batch_size = self.p * self.k
+        self.seed = int(seed)
+        self._epoch = 0
+        self.num_batches = max(1, len(self.labels) // max(1, self.batch_size)) if self.labels else 0
+
+    def __len__(self) -> int:
+        return self.num_batches
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self._epoch)
+        self._epoch += 1
+        if not self.classes:
+            return
+
+        pools: Dict[int, List[int]] = {}
+        for c in self.classes:
+            idxs = list(self.class_to_indices[c])
+            rng.shuffle(idxs)
+            pools[c] = idxs
+
+        class_order = list(self.classes)
+        for _ in range(self.num_batches):
+            if len(class_order) < self.p:
+                refill = list(self.classes)
+                rng.shuffle(refill)
+                class_order.extend(refill)
+            chosen_classes = class_order[: self.p]
+            class_order = class_order[self.p :]
+
+            batch: List[int] = []
+            for c in chosen_classes:
+                src = self.class_to_indices[c]
+                if len(pools[c]) < self.k:
+                    refill = list(src)
+                    rng.shuffle(refill)
+                    pools[c].extend(refill)
+                while len(pools[c]) < self.k:
+                    pools[c].append(rng.choice(src))
+                batch.extend(pools[c][: self.k])
+                pools[c] = pools[c][self.k :]
+            yield batch
+
+
 class TwoCropTransform:
     def __init__(self, transform):
         self.transform = transform
@@ -91,14 +170,17 @@ class TwoCropTransform:
 
 
 def get_transforms(
-    max_shear: float = 10.0,
+    max_shear: float = 4.0,
     brightness_range: Tuple[float, float] = (0.8, 1.2),
-    p_erase: float = 0.5,
+    p_erase: float = 0.3,
     noise_std: float = 8.0,
+    p_blur: float = 0.5,
+    blur_sigma: Tuple[float, float] = (0.1, 2.0),
 ):
     return Compose([
         RandomShear(max_angle=max_shear),
         RandomBrightness(min_ratio=brightness_range[0], max_ratio=brightness_range[1]),
+        RandomGaussianBlur(p=p_blur, sigma=blur_sigma),
         GaussianNoise(mean=0.0, std=noise_std),
         RandomErase(p=p_erase),
     ])

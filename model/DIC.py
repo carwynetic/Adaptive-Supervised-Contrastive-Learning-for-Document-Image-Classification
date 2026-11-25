@@ -1,7 +1,7 @@
 """
 Document Image Classification (DIC) - Group-wise Early-Exiting Architecture.
 Kiến trúc mô hình phân cụm nhóm tầng (Group-wise Layerwise Learning) cho DIC:
-    - Phân chia 5 tầng Exit thành các cụm độc lập (mặc định: Group 1 [1, 4] và Group 2 [8, 10, 12]).
+    - Phân chia 6 tầng Exit thành các cụm độc lập (mặc định: Group 1 [0, 1, 4] và Group 2 [8, 10, 12]).
     - Hỗ trợ forward chọn lọc theo Group (early termination): Tiết kiệm tính toán khi huấn luyện Group 1.
     - Hỗ trợ đóng băng/mở khóa độc lập theo từng Group để triệt tiêu xung đột gradient.
     - Tương thích 100% với DICWithoutGroupwise, DICTrainer và EarlyExitEvaluator.
@@ -39,7 +39,7 @@ class DIC(nn.Module):
     def __init__(
         self,
         num_classes: int = 16,
-        exit_layers: Sequence[int] = (1, 4, 8, 10, 12),
+        exit_layers: Sequence[int] = (0, 1, 4, 8, 10, 12),
         groups: Optional[Dict[str, Sequence[int]]] = None,
         projection_dim: int = 128,
         config_dir: Optional[Union[str, Path]] = None,
@@ -146,6 +146,7 @@ class DIC(nn.Module):
         pixel_values: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         compute_projections: bool = True,
+        compute_logits: bool = True,
     ) -> DICOutput:
         """
         Forward đầy đủ qua tất cả các tầng exits.
@@ -173,18 +174,20 @@ class DIC(nn.Module):
         cls_tokens_dict: Dict[int, torch.Tensor] = {}
 
         for layer in self.exit_layers:
-            cls_token = self.backbone.extract_cls_at_layer(hidden_states, layer)
+            if layer == 0:
+                cls_token = hidden_states[0].mean(dim=1)
+            else:
+                cls_token = self.backbone.extract_cls_at_layer(hidden_states, layer)
             cls_tokens_dict[layer] = cls_token
 
-            # Logits phân loại
-            logits_dict[layer] = self.exit_heads[str(layer)](cls_token)
+            if compute_logits:
+                logits_dict[layer] = self.exit_heads[str(layer)](cls_token)
 
-            # Vector chiếu tương phản L2
             if compute_projections and projections_dict is not None:
                 projections_dict[layer] = self.projection_heads[str(layer)](cls_token)
 
         final_layer = self.exit_layers[-1]
-        final_logits = logits_dict[final_layer]
+        final_logits = logits_dict.get(final_layer) if compute_logits else None
 
         return DICOutput(
             logits_dict=logits_dict,
@@ -205,6 +208,7 @@ class DIC(nn.Module):
         pixel_values: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         compute_projections: bool = True,
+        compute_logits: bool = True,
     ) -> DICOutput:
         """
         Forward chọn lọc chỉ tính toán các tầng thuộc một Group cụ thể.
@@ -229,15 +233,20 @@ class DIC(nn.Module):
         cls_tokens_dict: Dict[int, torch.Tensor] = {}
 
         for layer in target_layers:
-            cls_token = self.backbone.extract_cls_at_layer(hidden_states, layer)
+            if layer == 0:
+                cls_token = hidden_states[0].mean(dim=1)
+            else:
+                cls_token = self.backbone.extract_cls_at_layer(hidden_states, layer)
             cls_tokens_dict[layer] = cls_token
-            logits_dict[layer] = self.exit_heads[str(layer)](cls_token)
+
+            if compute_logits:
+                logits_dict[layer] = self.exit_heads[str(layer)](cls_token)
 
             if compute_projections and projections_dict is not None:
                 projections_dict[layer] = self.projection_heads[str(layer)](cls_token)
 
         last_layer = target_layers[-1]
-        final_logits = logits_dict[last_layer]
+        final_logits = logits_dict.get(last_layer) if compute_logits else None
 
         return DICOutput(
             logits_dict=logits_dict,
@@ -260,8 +269,8 @@ if __name__ == "__main__":
     print(f"Target Device: {device}")
 
     # 1. Khởi tạo mô hình
-    exit_layers = (1, 4, 8, 10, 12)
-    custom_groups = {"group1": (1, 4), "group2": (8, 10, 12)}
+    exit_layers = (0, 1, 4, 8, 10, 12)
+    custom_groups = {"group1": (0, 1, 4), "group2": (8, 10, 12)}
     model = DIC(num_classes=16, exit_layers=exit_layers, groups=custom_groups).to(device)
 
     print(f"[+] Exit layers : {model.exit_layers}")
@@ -278,23 +287,23 @@ if __name__ == "__main__":
     out_full = model(dummy_input_ids, dummy_bbox, dummy_pixel_values, compute_projections=True)
     print(f"  All exits computed: {list(out_full.logits_dict.keys())}")
     print(f"  Final logits shape: {out_full.final_logits.shape}")
-    assert len(out_full.logits_dict) == 5, "Lỗi: Không đủ 5 tầng exits!"
+    assert len(out_full.logits_dict) == 6, "Lỗi: Không đủ 6 tầng exits!"
 
     # 4. Test Forward Group 1 (Selective Forward)
     print("\n--- 2. Testing Forward Group 1 (Selective) ---")
     out_g1 = model.forward_group("group1", dummy_input_ids, dummy_bbox, dummy_pixel_values, compute_projections=True)
     print(f"  Group 1 exits computed: {list(out_g1.logits_dict.keys())}")
-    assert set(out_g1.logits_dict.keys()) == {1, 4}, "Lỗi: Group 1 phải chỉ có tầng 1 và 4!"
+    assert set(out_g1.logits_dict.keys()) == {0, 1, 4}, "Lỗi: Group 1 phải chỉ có tầng 0, 1 và 4!"
 
     # 5. Test Group Freezing Controls
     print("\n--- 3. Testing Group Freezing Controls ---")
     model.freeze_group("group1")
-    g1_frozen = all(not p.requires_grad for l in (1, 4) for p in model.exit_heads[str(l)].parameters())
+    g1_frozen = all(not p.requires_grad for l in (0, 1, 4) for p in model.exit_heads[str(l)].parameters())
     print(f"  Group 1 heads frozen: {g1_frozen} (Expected: True)")
     assert g1_frozen, "Lỗi: Heads của Group 1 chưa được đóng băng!"
 
     model.unfreeze_group("group1")
-    g1_unfrozen = all(p.requires_grad for l in (1, 4) for p in model.exit_heads[str(l)].parameters())
+    g1_unfrozen = all(p.requires_grad for l in (0, 1, 4) for p in model.exit_heads[str(l)].parameters())
     print(f"  Group 1 heads unfrozen: {g1_unfrozen} (Expected: True)")
     assert g1_unfrozen, "Lỗi: Heads của Group 1 chưa được mở khóa!"
 
