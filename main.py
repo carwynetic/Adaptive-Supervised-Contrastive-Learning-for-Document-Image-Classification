@@ -446,6 +446,7 @@ def _run_exp2_from_args(args: argparse.Namespace) -> None:
         dry_run=args.dry_run,
         run_stage2_probe=args.run_stage2_probe,
         resume=_arg(args, "resume", None, True),
+        stage1_ckpt_for_stage2=_arg(args, "s1_ckpt_for_s2", None, "best"),
     )
 
 
@@ -505,6 +506,7 @@ def _run_exp3_from_args(args: argparse.Namespace) -> None:
         dry_run=args.dry_run,
         run_stage2_probe=args.run_stage2_probe,
         resume=_arg(args, "resume", None, True),
+        stage1_ckpt_for_stage2=_arg(args, "s1_ckpt_for_s2", None, "best"),
     )
 
 
@@ -700,12 +702,13 @@ def build_parser() -> argparse.ArgumentParser:
     s2_grp.add_argument("--s2_weight_decay", type=float, default=s2_def.weight_decay)
     s2_grp.add_argument("--s2_label_smoothing", type=float, default=s2_def.label_smoothing)
     s2_grp.add_argument("--s2_use_aug", action=argparse.BooleanOptionalAction, default=s2_def.use_augmentation)
+    s2_grp.add_argument("--s1_ckpt_for_s2", type=str, default="best", choices=["best", "final"])
 
     parser.add_argument("--probe_every_n_steps", type=int, default=10)
     parser.add_argument("--landscape_grid_size", type=int, default=11)
     parser.add_argument("--landscape_span", type=float, default=0.5)
     parser.add_argument("--max_samples", type=int, default=None)
-    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--num_workers", type=int, default=0 if sys.platform.startswith("win") else 2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--use_amp", action=argparse.BooleanOptionalAction, default=True)

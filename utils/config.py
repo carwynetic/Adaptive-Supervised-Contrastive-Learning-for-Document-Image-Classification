@@ -36,13 +36,16 @@ class EEBaselineConfig:
 
 @dataclass
 class Stage1SupConConfig:
-    """Hyperparameters for Stage 1 multi-exit contrastive representation learning (SimCLR + ConOSR SupCon-ST, no Mixup)."""
+    """Hyperparameters for Stage 1 multi-exit contrastive representation learning (SimCLR + ConOSR SupCon-ST, no Mixup).
+    ConOSR official repo uses 600 contrastive epochs vs 20 classifier epochs (30x) for from-scratch CNN;
+    scaled 1/10 for pretrained LayoutLMv3 fine-tuning -> 60 epochs (3x Stage 2's 20 epochs).
+    """
 
-    epochs: int = 30
-    batch_size: int = 4
-    grad_accum_steps: int = 4
+    epochs: int = 60
+    batch_size: int = 16
+    grad_accum_steps: int = 1
     sampler: str = "pk"
-    pk_p: int = 2
+    pk_p: int = 8
     pk_k: int = 2
 
     temperature: float = 0.1

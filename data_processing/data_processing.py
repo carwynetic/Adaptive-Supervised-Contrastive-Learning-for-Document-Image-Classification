@@ -123,6 +123,12 @@ class PKBatchSampler(Sampler[List[int]]):
         self._epoch = 0
         self.num_batches = max(1, len(self.labels) // max(1, self.batch_size)) if self.labels else 0
 
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = max(0, int(epoch))
+
+    def get_epoch(self) -> int:
+        return int(self._epoch)
+
     def __len__(self) -> int:
         return self.num_batches
 

@@ -1255,6 +1255,104 @@ class LayoutLMv3Backbone(nn.Module):
 
         return embedding_output, attention_mask, final_position_ids, final_bbox
 
+    def _build_extended_mask(
+        self,
+        emb_out: torch.Tensor,
+        attn_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        m = self.model
+        cfg = m.config
+        if create_bidirectional_mask is not None:
+            return create_bidirectional_mask(config=cfg, inputs_embeds=emb_out, attention_mask=attn_mask)
+        return m.get_extended_attention_mask(attn_mask, None, emb_out.device, dtype=emb_out.dtype)
+
+    def _compute_rel_pos_biases(
+        self,
+        final_pos_ids: Optional[torch.Tensor],
+        final_bbox: Optional[torch.Tensor],
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        enc = self.model.encoder
+        rel_pos = enc._cal_1d_pos_emb(final_pos_ids) if enc.has_relative_attention_bias else None
+        rel_2d_pos = enc._cal_2d_pos_emb(final_bbox) if enc.has_spatial_attention_bias else None
+        return rel_pos, rel_2d_pos
+
+    def _get_embedding_modules(self) -> List[nn.Module]:
+        m = self.model
+        mods: List[nn.Module] = [m.embeddings]
+        for attr in ("patch_embed", "pos_drop", "norm", "LayerNorm", "dropout"):
+            sub = getattr(m, attr, None)
+            if isinstance(sub, nn.Module):
+                mods.append(sub)
+        return mods
+
+    def forward_embeddings_state(
+        self,
+        input_ids: torch.Tensor,
+        bbox: Optional[torch.Tensor],
+        pixel_values: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        eval_mode: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if not eval_mode:
+            emb_out, attn_mask, final_pos_ids, final_bbox = self._compute_embeddings_and_meta(
+                input_ids, bbox, pixel_values, attention_mask
+            )
+            ext_mask = self._build_extended_mask(emb_out, attn_mask)
+            return emb_out, ext_mask, final_pos_ids, final_bbox
+
+        mods = self._get_embedding_modules()
+        prev_modes = [mod.training for mod in mods]
+        try:
+            for mod in mods:
+                mod.eval()
+            with torch.no_grad():
+                emb_out, attn_mask, final_pos_ids, final_bbox = self._compute_embeddings_and_meta(
+                    input_ids, bbox, pixel_values, attention_mask
+                )
+                ext_mask = self._build_extended_mask(emb_out, attn_mask)
+        finally:
+            for mod, mode in zip(mods, prev_modes):
+                mod.train(mode)
+        return (
+            emb_out.detach(),
+            ext_mask.detach() if isinstance(ext_mask, torch.Tensor) else ext_mask,
+            final_pos_ids,
+            final_bbox,
+        )
+
+    def forward_layer_slice(
+        self,
+        hidden_states: torch.Tensor,
+        ext_mask: torch.Tensor,
+        rel_pos: Optional[torch.Tensor],
+        rel_2d_pos: Optional[torch.Tensor],
+        start_layer: int,
+        end_layer: int,
+        eval_mode: bool = False,
+    ) -> torch.Tensor:
+        enc = self.model.encoder
+        if not eval_mode:
+            h = hidden_states
+            for layer_idx in range(start_layer, end_layer):
+                layer_out = enc.layer[layer_idx](h, ext_mask, rel_pos=rel_pos, rel_2d_pos=rel_2d_pos)
+                h = layer_out[0] if isinstance(layer_out, tuple) else layer_out
+            return h
+
+        slice_mods = [enc.layer[i] for i in range(start_layer, end_layer)]
+        prev_modes = [mod.training for mod in slice_mods]
+        try:
+            for mod in slice_mods:
+                mod.eval()
+            with torch.no_grad():
+                h = hidden_states
+                for layer_idx in range(start_layer, end_layer):
+                    layer_out = enc.layer[layer_idx](h, ext_mask, rel_pos=rel_pos, rel_2d_pos=rel_2d_pos)
+                    h = layer_out[0] if isinstance(layer_out, tuple) else layer_out
+        finally:
+            for mod, mode in zip(slice_mods, prev_modes):
+                mod.train(mode)
+        return h.detach()
+
     def forward_recompute_slice(
         self,
         input_ids: torch.Tensor,
@@ -1263,61 +1361,41 @@ class LayoutLMv3Backbone(nn.Module):
         attention_mask: Optional[torch.Tensor],
         prev_exit: int,
         target_exit: int,
+        prefix_eval: bool = True,
     ) -> torch.Tensor:
-        m = self.model
-        cfg = m.config
-        enc = m.encoder
-        device = input_ids.device
-
         if target_exit == 0:
-            emb_out, _, _, _ = self._compute_embeddings_and_meta(input_ids, bbox, pixel_values, attention_mask)
+            emb_out, _, _, _ = self.forward_embeddings_state(
+                input_ids, bbox, pixel_values, attention_mask, eval_mode=False
+            )
             return emb_out.mean(dim=1)
 
         if prev_exit < 0:
-            emb_out, attn_mask, final_pos_ids, final_bbox = self._compute_embeddings_and_meta(
-                input_ids, bbox, pixel_values, attention_mask
+            emb_out, ext_mask, final_pos_ids, final_bbox = self.forward_embeddings_state(
+                input_ids, bbox, pixel_values, attention_mask, eval_mode=False
             )
-            if create_bidirectional_mask is not None:
-                ext_mask = create_bidirectional_mask(config=cfg, inputs_embeds=emb_out, attention_mask=attn_mask)
-            else:
-                ext_mask = m.get_extended_attention_mask(attn_mask, None, device, dtype=emb_out.dtype)
-            rel_pos = enc._cal_1d_pos_emb(final_pos_ids) if enc.has_relative_attention_bias else None
-            rel_2d_pos = enc._cal_2d_pos_emb(final_bbox) if enc.has_spatial_attention_bias else None
-            hidden_states = emb_out
-            for layer_idx in range(target_exit):
-                layer_out = enc.layer[layer_idx](hidden_states, ext_mask, rel_pos=rel_pos, rel_2d_pos=rel_2d_pos)
-                hidden_states = layer_out[0] if isinstance(layer_out, tuple) else layer_out
-            return hidden_states[:, 0, :]
+            rel_pos, rel_2d_pos = self._compute_rel_pos_biases(final_pos_ids, final_bbox)
+            h = self.forward_layer_slice(emb_out, ext_mask, rel_pos, rel_2d_pos, 0, target_exit, eval_mode=False)
+            return h[:, 0, :]
 
+        emb_out, ext_mask, final_pos_ids, final_bbox = self.forward_embeddings_state(
+            input_ids, bbox, pixel_values, attention_mask, eval_mode=prefix_eval
+        )
         with torch.no_grad():
-            emb_out, attn_mask, final_pos_ids, final_bbox = self._compute_embeddings_and_meta(
-                input_ids, bbox, pixel_values, attention_mask
-            )
-            if create_bidirectional_mask is not None:
-                ext_mask = create_bidirectional_mask(config=cfg, inputs_embeds=emb_out, attention_mask=attn_mask)
-            else:
-                ext_mask = m.get_extended_attention_mask(attn_mask, None, device, dtype=emb_out.dtype)
-            rel_pos_ng = enc._cal_1d_pos_emb(final_pos_ids) if enc.has_relative_attention_bias else None
-            rel_2d_pos_ng = enc._cal_2d_pos_emb(final_bbox) if enc.has_spatial_attention_bias else None
-            hidden_states = emb_out
-            for layer_idx in range(prev_exit):
-                layer_out = enc.layer[layer_idx](hidden_states, ext_mask, rel_pos=rel_pos_ng, rel_2d_pos=rel_2d_pos_ng)
-                hidden_states = layer_out[0] if isinstance(layer_out, tuple) else layer_out
-            hidden_states = hidden_states.detach()
-            ext_mask = ext_mask.detach() if isinstance(ext_mask, torch.Tensor) else ext_mask
+            rel_pos_ng, rel_2d_pos_ng = self._compute_rel_pos_biases(final_pos_ids, final_bbox)
+        hidden_states = (
+            self.forward_layer_slice(emb_out, ext_mask, rel_pos_ng, rel_2d_pos_ng, 0, prev_exit, eval_mode=prefix_eval)
+            if prev_exit > 0
+            else emb_out.detach()
+        )
 
         if prev_exit == 0:
-            rel_pos = enc._cal_1d_pos_emb(final_pos_ids) if enc.has_relative_attention_bias else None
-            rel_2d_pos = enc._cal_2d_pos_emb(final_bbox) if enc.has_spatial_attention_bias else None
+            rel_pos, rel_2d_pos = self._compute_rel_pos_biases(final_pos_ids, final_bbox)
         else:
             rel_pos = rel_pos_ng.detach() if isinstance(rel_pos_ng, torch.Tensor) else rel_pos_ng
             rel_2d_pos = rel_2d_pos_ng.detach() if isinstance(rel_2d_pos_ng, torch.Tensor) else rel_2d_pos_ng
 
-        for layer_idx in range(prev_exit, target_exit):
-            layer_out = enc.layer[layer_idx](hidden_states, ext_mask, rel_pos=rel_pos, rel_2d_pos=rel_2d_pos)
-            hidden_states = layer_out[0] if isinstance(layer_out, tuple) else layer_out
-
-        return hidden_states[:, 0, :]
+        h = self.forward_layer_slice(hidden_states, ext_mask, rel_pos, rel_2d_pos, prev_exit, target_exit, eval_mode=False)
+        return h[:, 0, :]
 
 
 if __name__ == "__main__":

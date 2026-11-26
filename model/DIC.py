@@ -265,6 +265,7 @@ class DIC(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         compute_projections: bool = True,
         compute_logits: bool = False,
+        prefix_eval: bool = True,
     ) -> DICOutput:
         if group_name not in self.groups:
             raise KeyError(f"Group '{group_name}' không tồn tại. Danh sách: {list(self.groups.keys())}")
@@ -277,6 +278,7 @@ class DIC(nn.Module):
             attention_mask=attention_mask,
             prev_exit=prev_exit,
             target_exit=target_exit,
+            prefix_eval=prefix_eval,
         )
         logits_dict: Dict[int, torch.Tensor] = {}
         projections_dict: Optional[Dict[int, torch.Tensor]] = {} if compute_projections else None

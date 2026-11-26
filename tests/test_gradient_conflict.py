@@ -1005,6 +1005,199 @@ def test_checkpoint_resume_exp3_groupwise_and_run_all(tmp_path: Path) -> None:
     assert (all_out / "figures" / "fig1_cosine_similarity_heatmaps.png").exists()
 
 
+def test_incremental_recompute_equivalence_and_deterministic_resume(tmp_path: Path) -> None:
+    import copy
+    from data_processing.data_processing import PKBatchSampler, get_smooth_labels
+    from model.DIC import DIC
+    from train_test.exp_runner import (
+        _forward_incremental_group_view,
+        _recompute_incremental_group_view,
+        _split_sequential_group_named_params,
+        run_exp3_groupwise,
+        set_seed,
+    )
+    from utils.losses import MultiExitSupConLoss
+
+    exits_6 = (0, 1, 4, 8, 10, 12)
+    specs_6 = [("group1", -1, 0), ("group2", 0, 1), ("group3", 1, 4), ("group4", 4, 8), ("group5", 8, 10), ("group6", 10, 12)]
+    groups_6 = {gn: (te,) for gn, _, te in specs_6}
+
+    set_seed(123)
+    m_inc = DIC(num_classes=16, exit_layers=exits_6, groups=groups_6)
+    m_full = copy.deepcopy(m_inc)
+    m_inc.train()
+    m_full.train()
+
+    part_inc = _split_sequential_group_named_params(m_inc, specs_6)
+    part_full = _split_sequential_group_named_params(m_full, specs_6)
+    opts_inc = {gn: torch.optim.SGD([p for _, p in plist], lr=1e-2) for gn, plist in part_inc.items()}
+    opts_full = {gn: torch.optim.SGD([p for _, p in plist], lr=1e-2) for gn, plist in part_full.items()}
+    crit = MultiExitSupConLoss(exit_layers=exits_6, temperature=0.1, base_temperature=0.1)
+
+    g_in = torch.Generator().manual_seed(77)
+    v1 = {
+        "input_ids": torch.randint(0, 1000, (4, 16), generator=g_in, dtype=torch.long),
+        "bbox": torch.zeros((4, 16, 4), dtype=torch.long),
+        "pixel_values": torch.randn((4, 3, 224, 224), generator=g_in),
+        "attention_mask": torch.ones((4, 16), dtype=torch.long),
+    }
+    v2 = {
+        "input_ids": v1["input_ids"].clone(),
+        "bbox": v1["bbox"].clone(),
+        "pixel_values": v1["pixel_values"] + 0.05 * torch.randn((4, 3, 224, 224), generator=g_in),
+        "attention_mask": v1["attention_mask"].clone(),
+    }
+    st = get_smooth_labels(torch.tensor([0, 0, 1, 1]), classid_list=16, smoothing_coeff=0.1)
+
+    c_v1 = None
+    c_v2 = None
+    for idx, (gn, prev_e, tgt_e) in enumerate(specs_6):
+        for o_gn, plist in part_inc.items():
+            for _, p in plist:
+                p.requires_grad = o_gn == gn
+        for o_gn, plist in part_full.items():
+            for _, p in plist:
+                p.requires_grad = o_gn == gn
+
+        set_seed(500 + idx)
+        opts_inc[gn].zero_grad()
+        p1_i = _forward_incremental_group_view(m_inc, v1, c_v1, prev_e, tgt_e)
+        p2_i = _forward_incremental_group_view(m_inc, v2, c_v2, prev_e, tgt_e)
+        l_inc = crit.supcon(torch.stack([p1_i, p2_i], dim=1), st)
+        l_inc.backward()
+        opts_inc[gn].step()
+        if idx < len(specs_6) - 1:
+            c_v1 = _recompute_incremental_group_view(m_inc, v1, c_v1, prev_e, tgt_e)
+            c_v2 = _recompute_incremental_group_view(m_inc, v2, c_v2, prev_e, tgt_e)
+
+        set_seed(500 + idx)
+        opts_full[gn].zero_grad()
+        o1_f = m_full.forward_group_recompute(gn, prev_e, **v1, compute_projections=True, compute_logits=False, prefix_eval=True)
+        o2_f = m_full.forward_group_recompute(gn, prev_e, **v2, compute_projections=True, compute_logits=False, prefix_eval=True)
+        l_full = crit.supcon(torch.stack([o1_f.projections_dict[tgt_e], o2_f.projections_dict[tgt_e]], dim=1), st)
+        l_full.backward()
+        opts_full[gn].step()
+
+        assert torch.allclose(l_inc.detach(), l_full.detach(), atol=1e-4), f"Mismatch at {gn}: {l_inc.item()} vs {l_full.item()}"
+
+    for k, t_inc in m_inc.state_dict().items():
+        assert torch.allclose(t_inc, m_full.state_dict()[k], atol=1e-4), f"State mismatch on {k}"
+
+    labels = [c for c in range(16) for _ in range(5)]
+    pk_a = PKBatchSampler(labels, p=4, k=2, seed=42)
+    _ = list(pk_a)
+    ep2_a = list(pk_a)
+    pk_b = PKBatchSampler(labels, p=4, k=2, seed=42)
+    pk_b.set_epoch(1)
+    ep2_b = list(pk_b)
+    assert ep2_a == ep2_b
+
+    sep_dir = tmp_path / "exp3_staged"
+    p_s1 = run_exp3_groupwise(
+        data_dir=tmp_path,
+        output_dir=sep_dir,
+        exit_layers=(0, 4, 12),
+        batch_size=2,
+        grad_accum_steps=1,
+        epochs=1,
+        epochs_stage2=0,
+        probe_every_n_steps=0,
+        max_samples=4,
+        device="cpu",
+        use_amp=False,
+        dry_run=True,
+        resume=True,
+    )
+    assert len(p_s1["epoch_logs"]) == 1
+    assert "val_total_loss" in p_s1["epoch_logs"][0]
+    assert p_s1["stage2_logs"] == []
+    assert (sep_dir / "stage1_best.pt").exists()
+
+    p_s2 = run_exp3_groupwise(
+        data_dir=tmp_path,
+        output_dir=sep_dir,
+        exit_layers=(0, 4, 12),
+        batch_size=2,
+        grad_accum_steps=1,
+        epochs=1,
+        epochs_stage2=1,
+        probe_every_n_steps=0,
+        max_samples=4,
+        device="cpu",
+        use_amp=False,
+        dry_run=True,
+        resume=True,
+    )
+    assert len(p_s2["epoch_logs"]) == 1
+    assert len(p_s2["stage2_logs"]) == 1
+
+    cont_dir = tmp_path / "exp3_cont"
+    p_cont = run_exp3_groupwise(
+        data_dir=tmp_path,
+        output_dir=cont_dir,
+        exit_layers=(0, 4, 12),
+        batch_size=2,
+        grad_accum_steps=1,
+        epochs=2,
+        warmup_ratio=0.0,
+        eta_min_ratio=1.0,
+        epochs_stage2=0,
+        probe_every_n_steps=0,
+        max_samples=4,
+        device="cpu",
+        use_amp=False,
+        dry_run=True,
+        resume=False,
+    )
+    split_dir = tmp_path / "exp3_split"
+    run_exp3_groupwise(
+        data_dir=tmp_path,
+        output_dir=split_dir,
+        exit_layers=(0, 4, 12),
+        batch_size=2,
+        grad_accum_steps=1,
+        epochs=1,
+        warmup_ratio=0.0,
+        eta_min_ratio=1.0,
+        epochs_stage2=0,
+        probe_every_n_steps=0,
+        max_samples=4,
+        device="cpu",
+        use_amp=False,
+        dry_run=True,
+        resume=True,
+    )
+    p_split = run_exp3_groupwise(
+        data_dir=tmp_path,
+        output_dir=split_dir,
+        exit_layers=(0, 4, 12),
+        batch_size=2,
+        grad_accum_steps=1,
+        epochs=2,
+        warmup_ratio=0.0,
+        eta_min_ratio=1.0,
+        epochs_stage2=0,
+        probe_every_n_steps=0,
+        max_samples=4,
+        device="cpu",
+        use_amp=False,
+        dry_run=True,
+        resume=True,
+    )
+    assert math.isclose(
+        p_cont["epoch_logs"][1]["train_total_loss"],
+        p_split["epoch_logs"][1]["train_total_loss"],
+        rel_tol=1e-4,
+        abs_tol=1e-4,
+    )
+    assert math.isclose(
+        p_cont["epoch_logs"][1]["val_total_loss"],
+        p_split["epoch_logs"][1]["val_total_loss"],
+        rel_tol=1e-4,
+        abs_tol=1e-4,
+    )
+
+
 def test_no_comments_or_docstrings_in_new_files() -> None:
     repo_root = Path(__file__).resolve().parent.parent
     new_files = [

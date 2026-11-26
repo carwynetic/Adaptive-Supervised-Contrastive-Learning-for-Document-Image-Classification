@@ -38,11 +38,53 @@ from utils.losses import MultiExitCELoss, MultiExitSupConLoss
 
 
 def set_seed(seed: int) -> None:
+    os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def _capture_rng_state() -> Dict[str, Any]:
+    state: Dict[str, Any] = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng_state(state: Optional[Dict[str, Any]]) -> None:
+    if not state:
+        return
+    if "python" in state:
+        random.setstate(state["python"])
+    if "numpy" in state:
+        np.random.set_state(state["numpy"])
+    if "torch_cpu" in state:
+        cpu_st = state["torch_cpu"]
+        if isinstance(cpu_st, torch.Tensor):
+            torch.set_rng_state(cpu_st.cpu().to(torch.uint8))
+    if torch.cuda.is_available() and "torch_cuda" in state:
+        cuda_states = state["torch_cuda"]
+        if isinstance(cuda_states, list) and len(cuda_states) == torch.cuda.device_count():
+            torch.cuda.set_rng_state_all([s.cpu().to(torch.uint8) if isinstance(s, torch.Tensor) else s for s in cuda_states])
+
+
+class _SeededWorkerInit:
+    def __init__(self, base_seed: int) -> None:
+        self.base_seed = int(base_seed)
+
+    def __call__(self, worker_id: int) -> None:
+        w_seed = (self.base_seed + worker_id) % (2**32)
+        random.seed(w_seed)
+        np.random.seed(w_seed)
+        torch.manual_seed(w_seed)
 
 
 def _save_checkpoint_atomic(state: Dict[str, Any], path: Path) -> None:
@@ -346,6 +388,9 @@ def _build_loaders(
         max_samples=max_samples,
     )
     pin = torch.cuda.is_available()
+    worker_init = _SeededWorkerInit(seed) if num_workers > 0 else None
+    val_worker_init = _SeededWorkerInit(seed + 10000) if num_workers > 0 else None
+    train_gen = torch.Generator().manual_seed(seed)
     if sampler_type == "pk" and len(train_ds) > 0:
         train_labels = [int(r["label"]) for r in train_ds.records]
         batch_sampler = PKBatchSampler(train_labels, p=pk_p, k=pk_k, seed=seed)
@@ -355,6 +400,7 @@ def _build_loaders(
             num_workers=num_workers,
             collate_fn=collator,
             pin_memory=pin,
+            worker_init_fn=worker_init,
         )
     else:
         train_loader = DataLoader(
@@ -365,16 +411,31 @@ def _build_loaders(
             collate_fn=collator,
             pin_memory=pin,
             drop_last=is_contrastive and len(train_ds) >= batch_size,
+            worker_init_fn=worker_init,
+            generator=train_gen,
         )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=val_bs,
-        shuffle=False,
-        num_workers=num_workers,
-        collate_fn=collator,
-        pin_memory=pin,
-        drop_last=False,
-    )
+    if is_contrastive and sampler_type == "pk" and len(val_ds) > 0:
+        val_labels = [int(r["label"]) for r in val_ds.records]
+        val_pk = PKBatchSampler(val_labels, p=pk_p, k=pk_k, seed=seed + 10000)
+        val_loader = DataLoader(
+            val_ds,
+            batch_sampler=val_pk,
+            num_workers=num_workers,
+            collate_fn=collator,
+            pin_memory=pin,
+            worker_init_fn=val_worker_init,
+        )
+    else:
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=val_bs,
+            shuffle=False,
+            num_workers=num_workers,
+            collate_fn=collator,
+            pin_memory=pin,
+            drop_last=False,
+            worker_init_fn=val_worker_init,
+        )
     return train_loader, val_loader
 
 
@@ -462,6 +523,78 @@ def _evaluate_dic_model(
     if model.is_encoder_frozen:
         model.backbone.eval()
     return {"accuracy": per_exit_acc, "ece": per_exit_ece}
+
+
+def _format_eta(seconds: float) -> str:
+    sec = max(0, int(round(seconds)))
+    m, s = divmod(sec, 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h}h{m:02d}m{s:02d}s"
+    return f"{m}m{s:02d}s"
+
+
+def _set_pk_sampler_epoch(loader: Any, epoch_zero_based: int) -> None:
+    bs = getattr(loader, "batch_sampler", None)
+    if bs is not None and hasattr(bs, "set_epoch"):
+        bs.set_epoch(epoch_zero_based)
+
+
+def _evaluate_dic_supcon_loss(
+    model: nn.Module,
+    val_loader: Any,
+    supcon_criterion: MultiExitSupConLoss,
+    exit_weights: Dict[int, float],
+    exit_layers: Sequence[int],
+    num_classes: int,
+    smoothing_coeff: float,
+    device: torch.device,
+    use_amp: bool,
+    amp_dtype: torch.dtype,
+    eval_seed: int,
+) -> Dict[str, Any]:
+    saved_rng = _capture_rng_state()
+    was_training = model.training
+    model.eval()
+    set_seed(eval_seed)
+    _set_pk_sampler_epoch(val_loader, 0)
+
+    total_loss = 0.0
+    per_exit = {l: 0.0 for l in exit_layers}
+    n_batches = 0
+    try:
+        with torch.no_grad():
+            for batch in val_loader:
+                n_batches += 1
+                labels = batch["labels"].to(device, non_blocking=True)
+                soft_targets = get_smooth_labels(
+                    labels,
+                    classid_list=num_classes,
+                    smoothing_coeff=smoothing_coeff,
+                ).to(device)
+                v1 = _move_view(batch["view1"], device)
+                v2 = _move_view(batch["view2"], device)
+                with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp and device.type == "cuda"):
+                    o1 = model(**v1, compute_projections=True, compute_logits=False)
+                    o2 = model(**v2, compute_projections=True, compute_logits=False)
+                p1_f32 = {l: t.float() for l, t in o1.projections_dict.items()}
+                p2_f32 = {l: t.float() for l, t in o2.projections_dict.items()}
+                l_dict = supcon_criterion((p1_f32, p2_f32), soft_targets)
+                step_total = 0.0
+                for l in exit_layers:
+                    lv = float(l_dict[l].detach().item())
+                    per_exit[l] += lv
+                    step_total += float(exit_weights[l]) * lv
+                total_loss += step_total
+                del o1, o2, l_dict
+    finally:
+        model.train(was_training)
+        _restore_rng_state(saved_rng)
+
+    return {
+        "total_loss": total_loss / max(1, n_batches),
+        "exit_losses": {str(l): per_exit[l] / max(1, n_batches) for l in exit_layers},
+    }
 
 
 # Source: Baseline EE training (one_stage_subgraphs_weighted, AdamW, max_confidence) from https://github.com/Jordy-VL/multi-modal-early-exit/blob/main/EE/configs.py & https://github.com/Jordy-VL/multi-modal-early-exit/blob/main/EE/IC_only.py
@@ -587,7 +720,8 @@ def run_exp1_hamed_ce(
         prober.history = list(ck.get("step_logs", []))
         best_val_acc = float(ck.get("best_val_acc", -1.0))
         elapsed_prior = float(ck.get("elapsed_sec", 0.0))
-        print(f"[Exp1 Hamed CE] Resumed from {last_ckpt} at epoch {start_epoch}/{epochs}")
+        _restore_rng_state(ck.get("rng_state"))
+        print(f"[Exp1 Hamed CE] Resumed from {last_ckpt} at epoch {start_epoch}/{epochs}", flush=True)
 
     model.train()
 
@@ -657,6 +791,7 @@ def run_exp1_hamed_ce(
                 "step_logs": prober.history,
                 "best_val_acc": best_val_acc,
                 "elapsed_sec": elapsed_prior + float(time.perf_counter() - t0),
+                "rng_state": _capture_rng_state(),
             },
             last_ckpt,
         )
@@ -664,7 +799,8 @@ def run_exp1_hamed_ce(
             f"[Exp1 Hamed CE | {weighting_mode}] Epoch {epoch}/{epochs} "
             f"loss={epoch_rec['train_total_loss']:.4f} "
             f"L{sorted_exits[0]}={val_metrics['accuracy'][str(sorted_exits[0])]:.2f}% "
-            f"L{sorted_exits[-1]}={val_l12:.2f}%"
+            f"L{sorted_exits[-1]}={val_l12:.2f}%",
+            flush=True,
         )
 
     del optimizer, scheduler, scaler
@@ -792,6 +928,7 @@ def run_exp2_supcon(
     dry_run: bool = False,
     run_stage2_probe: bool = True,
     resume: bool = True,
+    stage1_ckpt_for_stage2: str = "best",
 ) -> Dict[str, Any]:
     set_seed(seed)
     dev = _resolve_device(device)
@@ -801,10 +938,17 @@ def run_exp2_supcon(
     log_file = out_path / "gradient_conflict_log.json"
     final_ckpt = out_path / "model_final.pt"
     s1_ckpt = out_path / "checkpoint_stage1_last.pt"
+    s1_best_ckpt = out_path / "stage1_best.pt"
+    s1_final_ckpt = out_path / "stage1_final.pt"
     s2_ckpt = out_path / "checkpoint_stage2_last.pt"
+    want_stage2 = bool(run_stage2_probe and epochs_stage2 > 0)
     if resume and log_file.exists() and final_ckpt.exists():
-        print(f"[Exp2 SupCon] Already completed at {out_path}, loading saved log.")
-        return json.loads(log_file.read_text(encoding="utf-8"))
+        saved_log = json.loads(log_file.read_text(encoding="utf-8"))
+        done_s1 = len(saved_log.get("epoch_logs", [])) >= epochs
+        done_s2 = (not want_stage2) or (len(saved_log.get("stage2_logs", [])) >= epochs_stage2)
+        if done_s1 and done_s2:
+            print(f"[Exp2 SupCon] Already completed at {out_path}, loading saved log.", flush=True)
+            return saved_log
 
     sorted_exits = sorted({int(l) for l in exit_layers})
     if not sorted_exits or any(l < 0 or l > 12 for l in sorted_exits):
@@ -898,26 +1042,35 @@ def run_exp2_supcon(
     stage1_done = False
     landscape: Optional[Dict[str, Any]] = None
     elapsed_prior = 0.0
+    best_s1_val_loss = float("inf")
     if resume and s1_ckpt.exists():
         ck1 = torch.load(s1_ckpt, map_location=dev, weights_only=False)
         model.load_state_dict(ck1["model_state_dict"])
-        base_opt.load_state_dict(ck1["optimizer_state_dict"])
-        scheduler.load_state_dict(ck1["scheduler_state_dict"])
-        if "scaler_state_dict" in ck1 and scaler.is_enabled():
+        if ck1.get("optimizer_state_dict"):
+            base_opt.load_state_dict(ck1["optimizer_state_dict"])
+        if ck1.get("scheduler_state_dict"):
+            scheduler.load_state_dict(ck1["scheduler_state_dict"])
+        if ck1.get("scaler_state_dict") and scaler.is_enabled():
             scaler.load_state_dict(ck1["scaler_state_dict"])
         start_epoch = int(ck1.get("epoch", 0)) + 1
         global_step = int(ck1.get("global_step", 0))
+        best_s1_val_loss = float(ck1.get("best_s1_val_loss", float("inf")))
         epoch_logs = list(ck1.get("epoch_logs", []))
         prober.history = list(ck1.get("step_logs", []))
         stage1_done = bool(ck1.get("stage1_done", False))
         landscape = ck1.get("landscape")
         elapsed_prior = float(ck1.get("elapsed_sec", 0.0))
-        print(f"[Exp2 SupCon Stage1] Resumed from {s1_ckpt} (start_epoch={start_epoch}/{epochs}, stage1_done={stage1_done})")
+        _restore_rng_state(ck1.get("rng_state"))
+        print(
+            f"[Exp2 SupCon Stage1] Resumed from {s1_ckpt} (start_epoch={start_epoch}/{epochs}, stage1_done={stage1_done})",
+            flush=True,
+        )
 
     model.unfreeze_encoder()
     model.train()
 
     for epoch in range(start_epoch, epochs + 1):
+        _set_pk_sampler_epoch(train_loader_s1, epoch - 1)
         optimizer.zero_grad(set_to_none=True)
         running_total = 0.0
         running_per_exit = {l: 0.0 for l in sorted_exits}
@@ -966,18 +1119,37 @@ def run_exp2_supcon(
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
+        val_s1 = _evaluate_dic_supcon_loss(
+            model=model,
+            val_loader=val_loader_s1,
+            supcon_criterion=supcon_criterion,
+            exit_weights=exit_weights,
+            exit_layers=sorted_exits,
+            num_classes=num_classes,
+            smoothing_coeff=smoothing_coeff,
+            device=dev,
+            use_amp=use_amp,
+            amp_dtype=amp_dt,
+            eval_seed=seed + 10000,
+        )
         epoch_rec: Dict[str, Any] = {
             "epoch": epoch,
             "train_total_loss": running_total / max(1, n_batches),
             "train_exit_losses": {str(l): running_per_exit[l] / max(1, n_batches) for l in sorted_exits},
+            "val_total_loss": val_s1["total_loss"],
+            "val_exit_losses": val_s1["exit_losses"],
             "lr": float(scheduler.get_last_lr()[0]),
         }
         epoch_logs.append(epoch_rec)
+        if val_s1["total_loss"] <= best_s1_val_loss:
+            best_s1_val_loss = val_s1["total_loss"]
+            _save_checkpoint_atomic(model.state_dict(), s1_best_ckpt)
         _save_checkpoint_atomic(
             {
                 "epoch": epoch,
-                "stage1_done": False,
+                "stage1_done": epoch >= epochs,
                 "global_step": global_step,
+                "best_s1_val_loss": best_s1_val_loss,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": base_opt.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
@@ -986,20 +1158,25 @@ def run_exp2_supcon(
                 "step_logs": prober.history,
                 "landscape": None,
                 "elapsed_sec": elapsed_prior + float(time.perf_counter() - t0),
+                "rng_state": _capture_rng_state(),
             },
             s1_ckpt,
         )
         print(
             f"[Exp2 SupCon Stage1 | {weighting_mode}] Epoch {epoch}/{epochs} "
-            f"loss={epoch_rec['train_total_loss']:.4f}"
+            f"train={epoch_rec['train_total_loss']:.4f} val={val_s1['total_loss']:.4f} "
+            f"best_val={best_s1_val_loss:.4f}",
+            flush=True,
         )
 
+    if not s1_final_ckpt.exists() or start_epoch <= epochs:
+        _save_checkpoint_atomic(model.state_dict(), s1_final_ckpt)
     del optimizer, base_opt, scheduler, scaler
     gc.collect()
     if dev.type == "cuda":
         torch.cuda.empty_cache()
 
-    if landscape is None:
+    if landscape is None and landscape_grid_size > 0 and probe_every_n_steps > 0:
         probe_batches = list(itertools.islice(val_loader_s1, 2))
 
         def _eval_landscape_losses() -> Dict[int, torch.Tensor]:
@@ -1033,11 +1210,13 @@ def run_exp2_supcon(
             span=landscape_span,
             seed=seed,
         )
+    if not s1_ckpt.exists():
         _save_checkpoint_atomic(
             {
                 "epoch": epochs,
                 "stage1_done": True,
                 "global_step": global_step,
+                "best_s1_val_loss": best_s1_val_loss,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": {},
                 "scheduler_state_dict": {},
@@ -1046,13 +1225,24 @@ def run_exp2_supcon(
                 "step_logs": prober.history,
                 "landscape": landscape,
                 "elapsed_sec": elapsed_prior + float(time.perf_counter() - t0),
+                "rng_state": _capture_rng_state(),
             },
             s1_ckpt,
         )
+    elif landscape is not None:
+        ck_keep = torch.load(s1_ckpt, map_location="cpu", weights_only=False)
+        ck_keep["landscape"] = landscape
+        ck_keep["stage1_done"] = True
+        _save_checkpoint_atomic(ck_keep, s1_ckpt)
 
     stage2_logs: List[Dict[str, Any]] = []
     bs2 = batch_size_stage2 if batch_size_stage2 is not None else batch_size
-    if run_stage2_probe and epochs_stage2 > 0:
+    if want_stage2:
+        if not (resume and s2_ckpt.exists()):
+            src_s1 = s1_best_ckpt if (stage1_ckpt_for_stage2 == "best" and s1_best_ckpt.exists()) else s1_final_ckpt
+            if src_s1.exists():
+                model.load_state_dict(torch.load(src_s1, map_location=dev, weights_only=False))
+                print(f"[Exp2 SupCon Stage2] Loaded Stage 1 weights from {src_s1}", flush=True)
         train_loader_s2, val_loader_s2 = _build_loaders(
             data_dir=data_dir,
             batch_size=bs2,
@@ -1201,7 +1391,138 @@ def run_exp2_supcon(
     return payload
 
 
-# Source: Exp 3 6-Group Sequential Recompute SupCon-ST ([0],[1],[4],[8],[10],[12], AIC-Lab Layerwise + SimCLR + ConOSR)
+def _forward_incremental_group_view(
+    model: DIC,
+    view: Dict[str, torch.Tensor],
+    cache: Optional[Dict[str, Any]],
+    prev_exit: int,
+    target_exit: int,
+) -> torch.Tensor:
+    bb = model.backbone
+    if target_exit == 0:
+        emb_out, _, _, _ = bb.forward_embeddings_state(
+            input_ids=view["input_ids"],
+            bbox=view["bbox"],
+            pixel_values=view["pixel_values"],
+            attention_mask=view["attention_mask"],
+            eval_mode=False,
+        )
+        feat = emb_out.mean(dim=1)
+    elif prev_exit < 0:
+        emb_out, ext_mask, pos_ids, bbox = bb.forward_embeddings_state(
+            input_ids=view["input_ids"],
+            bbox=view["bbox"],
+            pixel_values=view["pixel_values"],
+            attention_mask=view["attention_mask"],
+            eval_mode=False,
+        )
+        rel_pos, rel_2d_pos = bb._compute_rel_pos_biases(pos_ids, bbox)
+        h = bb.forward_layer_slice(emb_out, ext_mask, rel_pos, rel_2d_pos, 0, target_exit, eval_mode=False)
+        feat = h[:, 0, :]
+    elif prev_exit == 0:
+        assert cache is not None
+        rel_pos, rel_2d_pos = bb._compute_rel_pos_biases(cache["pos_ids"], cache["bbox"])
+        h = bb.forward_layer_slice(
+            cache["h"], cache["ext_mask"], rel_pos, rel_2d_pos, 0, target_exit, eval_mode=False
+        )
+        feat = h[:, 0, :]
+    else:
+        assert cache is not None
+        h = bb.forward_layer_slice(
+            cache["h"],
+            cache["ext_mask"],
+            cache["rel_pos"],
+            cache["rel_2d_pos"],
+            prev_exit,
+            target_exit,
+            eval_mode=False,
+        )
+        feat = h[:, 0, :]
+    return model.projection_heads[str(target_exit)](feat)
+
+
+def _recompute_incremental_group_view(
+    model: DIC,
+    view: Dict[str, torch.Tensor],
+    cache: Optional[Dict[str, Any]],
+    prev_exit: int,
+    target_exit: int,
+) -> Dict[str, Any]:
+    bb = model.backbone
+    if target_exit == 0:
+        h0, ext_mask, pos_ids, bbox = bb.forward_embeddings_state(
+            input_ids=view["input_ids"],
+            bbox=view["bbox"],
+            pixel_values=view["pixel_values"],
+            attention_mask=view["attention_mask"],
+            eval_mode=True,
+        )
+        return {
+            "h": h0,
+            "ext_mask": ext_mask,
+            "pos_ids": pos_ids,
+            "bbox": bbox,
+            "rel_pos": None,
+            "rel_2d_pos": None,
+        }
+    if prev_exit < 0:
+        h0, ext_mask, pos_ids, bbox = bb.forward_embeddings_state(
+            input_ids=view["input_ids"],
+            bbox=view["bbox"],
+            pixel_values=view["pixel_values"],
+            attention_mask=view["attention_mask"],
+            eval_mode=True,
+        )
+        with torch.no_grad():
+            rel_pos_new, rel_2d_pos_new = bb._compute_rel_pos_biases(pos_ids, bbox)
+        rel_pos_d = rel_pos_new.detach() if isinstance(rel_pos_new, torch.Tensor) else rel_pos_new
+        rel_2d_d = rel_2d_pos_new.detach() if isinstance(rel_2d_pos_new, torch.Tensor) else rel_2d_pos_new
+        h_new = bb.forward_layer_slice(h0, ext_mask, rel_pos_d, rel_2d_d, 0, target_exit, eval_mode=True)
+        return {
+            "h": h_new,
+            "ext_mask": ext_mask,
+            "pos_ids": pos_ids,
+            "bbox": bbox,
+            "rel_pos": rel_pos_d,
+            "rel_2d_pos": rel_2d_d,
+        }
+    assert cache is not None
+    if prev_exit == 0:
+        with torch.no_grad():
+            rel_pos_new, rel_2d_pos_new = bb._compute_rel_pos_biases(cache["pos_ids"], cache["bbox"])
+        rel_pos_d = rel_pos_new.detach() if isinstance(rel_pos_new, torch.Tensor) else rel_pos_new
+        rel_2d_d = rel_2d_pos_new.detach() if isinstance(rel_2d_pos_new, torch.Tensor) else rel_2d_pos_new
+        h_new = bb.forward_layer_slice(
+            cache["h"], cache["ext_mask"], rel_pos_d, rel_2d_d, 0, target_exit, eval_mode=True
+        )
+        return {
+            "h": h_new,
+            "ext_mask": cache["ext_mask"],
+            "pos_ids": cache["pos_ids"],
+            "bbox": cache["bbox"],
+            "rel_pos": rel_pos_d,
+            "rel_2d_pos": rel_2d_d,
+        }
+    h_new = bb.forward_layer_slice(
+        cache["h"],
+        cache["ext_mask"],
+        cache["rel_pos"],
+        cache["rel_2d_pos"],
+        prev_exit,
+        target_exit,
+        eval_mode=True,
+    )
+    return {
+        "h": h_new,
+        "ext_mask": cache["ext_mask"],
+        "pos_ids": cache["pos_ids"],
+        "bbox": cache["bbox"],
+        "rel_pos": cache["rel_pos"],
+        "rel_2d_pos": cache["rel_2d_pos"],
+    }
+
+
+# Source: Exp 3 6-Group Incremental Sequential Recompute SupCon-ST ([0],[1],[4],[8],[10],[12], AIC-Lab Layerwise + SimCLR + ConOSR)
 def run_exp3_groupwise(
     data_dir: Union[str, Path],
     output_dir: Union[str, Path],
@@ -1209,12 +1530,12 @@ def run_exp3_groupwise(
     num_classes: int = 16,
     weighting_mode: str = "uniform",
     gamma: float = 0.5,
-    batch_size: int = 4,
-    grad_accum_steps: int = 4,
+    batch_size: int = 16,
+    grad_accum_steps: int = 1,
     sampler: str = "pk",
-    pk_p: int = 2,
+    pk_p: int = 8,
     pk_k: int = 2,
-    epochs: int = 30,
+    epochs: int = 60,
     lr: float = 5e-5,
     weight_decay: float = 1e-4,
     exclude_bias_norm: bool = True,
@@ -1253,6 +1574,7 @@ def run_exp3_groupwise(
     dry_run: bool = False,
     run_stage2_probe: bool = True,
     resume: bool = True,
+    stage1_ckpt_for_stage2: str = "best",
 ) -> Dict[str, Any]:
     set_seed(seed)
     dev = _resolve_device(device)
@@ -1265,9 +1587,14 @@ def run_exp3_groupwise(
     s1_best_ckpt = out_path / "stage1_best.pt"
     s1_final_ckpt = out_path / "stage1_final.pt"
     s2_ckpt = out_path / "checkpoint_stage2_last.pt"
+    want_stage2 = bool(run_stage2_probe and epochs_stage2 > 0)
     if resume and log_file.exists() and final_ckpt.exists():
-        print(f"[Exp3 Groupwise] Already completed at {out_path}, loading saved log.")
-        return json.loads(log_file.read_text(encoding="utf-8"))
+        saved_log = json.loads(log_file.read_text(encoding="utf-8"))
+        done_s1 = len(saved_log.get("epoch_logs", [])) >= epochs
+        done_s2 = (not want_stage2) or (len(saved_log.get("stage2_logs", [])) >= epochs_stage2)
+        if done_s1 and done_s2:
+            print(f"[Exp3 Groupwise] Already completed at {out_path}, loading saved log.", flush=True)
+            return saved_log
 
     sorted_exits = sorted({int(l) for l in exit_layers})
     if not sorted_exits or any(l < 0 or l > 12 for l in sorted_exits):
@@ -1372,7 +1699,7 @@ def run_exp3_groupwise(
     epoch_logs: List[Dict[str, Any]] = []
     global_step = 0
     start_epoch = 1
-    best_s1_loss = float("inf")
+    best_s1_val_loss = float("inf")
     landscape: Optional[Dict[str, Any]] = None
     elapsed_prior = 0.0
     if resume and s1_ckpt.exists():
@@ -1390,17 +1717,26 @@ def run_exp3_groupwise(
                 scalers[g_name].load_state_dict(saved_scalers[g_name])
         start_epoch = int(ck1.get("epoch", 0)) + 1
         global_step = int(ck1.get("global_step", 0))
-        best_s1_loss = float(ck1.get("best_s1_loss", float("inf")))
+        best_s1_val_loss = float(ck1.get("best_s1_val_loss", ck1.get("best_s1_loss", float("inf"))))
         epoch_logs = list(ck1.get("epoch_logs", []))
         prober.history = list(ck1.get("step_logs", []))
         landscape = ck1.get("landscape")
         elapsed_prior = float(ck1.get("elapsed_sec", 0.0))
-        print(f"[Exp3 6-Group Recompute Stage1] Resumed from {s1_ckpt} at epoch {start_epoch}/{epochs}")
+        _restore_rng_state(ck1.get("rng_state"))
+        print(
+            f"[Exp3 6-Group Recompute Stage1] Resumed from {s1_ckpt} at epoch {start_epoch}/{epochs} "
+            f"(best_val={best_s1_val_loss:.4f})",
+            flush=True,
+        )
 
     model.unfreeze_encoder()
     model.train()
+    total_s1_batches = len(train_loader_s1)
+    log_interval = max(1, min(5, total_s1_batches))
 
     for epoch in range(start_epoch, epochs + 1):
+        _set_pk_sampler_epoch(train_loader_s1, epoch - 1)
+        ep_t0 = time.perf_counter()
         for g_opt in opts.values():
             g_opt.zero_grad(set_to_none=True)
         running_total = 0.0
@@ -1427,9 +1763,13 @@ def run_exp3_groupwise(
                 prober.probe(step=global_step, exit_losses=probe_losses, weights=exit_weights)
                 del po1, po2, probe_losses
 
-            do_step = (step_idx % max(1, grad_accum_steps) == 0) or (step_idx == len(train_loader_s1))
+            do_step = (step_idx % max(1, grad_accum_steps) == 0) or (step_idx == total_s1_batches)
             step_loss_sum = 0.0
-            for g_name, prev_exit, target_exit in group_specs:
+            cache_v1: Optional[Dict[str, Any]] = None
+            cache_v2: Optional[Dict[str, Any]] = None
+            last_group_idx = len(group_specs) - 1
+
+            for g_idx, (g_name, prev_exit, target_exit) in enumerate(group_specs):
                 g_opt = opts.get(g_name)
                 if g_opt is None:
                     continue
@@ -1438,32 +1778,14 @@ def run_exp3_groupwise(
                     for p in plist:
                         p.requires_grad = req
                 with torch.amp.autocast("cuda", dtype=amp_dt, enabled=use_amp and dev.type == "cuda"):
-                    o1 = model.forward_group_recompute(
-                        g_name,
-                        prev_exit,
-                        **v1,
-                        compute_projections=True,
-                        compute_logits=False,
-                    )
-                    o2 = model.forward_group_recompute(
-                        g_name,
-                        prev_exit,
-                        **v2,
-                        compute_projections=True,
-                        compute_logits=False,
-                    )
-                lv = supcon_criterion.supcon(
-                    torch.stack(
-                        [o1.projections_dict[target_exit].float(), o2.projections_dict[target_exit].float()],
-                        dim=1,
-                    ),
-                    soft_targets,
-                )
+                    p1 = _forward_incremental_group_view(model, v1, cache_v1, prev_exit, target_exit)
+                    p2 = _forward_incremental_group_view(model, v2, cache_v2, prev_exit, target_exit)
+                lv = supcon_criterion.supcon(torch.stack([p1.float(), p2.float()], dim=1), soft_targets)
                 lv_val = float(lv.detach().item())
                 running_per_exit[target_exit] += lv_val
                 step_loss_sum += float(exit_weights[target_exit]) * lv_val
                 scalers[g_name].scale(lv / float(max(1, grad_accum_steps))).backward()
-                del o1, o2, lv
+                del p1, p2, lv
                 if do_step:
                     scalers[g_name].unscale_(g_opt)
                     if max_grad_norm > 0:
@@ -1472,27 +1794,64 @@ def run_exp3_groupwise(
                     scalers[g_name].update()
                     scheds[g_name].step()
                     g_opt.zero_grad(set_to_none=True)
+                if g_idx < last_group_idx:
+                    with torch.amp.autocast("cuda", dtype=amp_dt, enabled=use_amp and dev.type == "cuda"):
+                        cache_v1 = _recompute_incremental_group_view(model, v1, cache_v1, prev_exit, target_exit)
+                        cache_v2 = _recompute_incremental_group_view(model, v2, cache_v2, prev_exit, target_exit)
 
+            del cache_v1, cache_v2
             running_total += step_loss_sum
+
+            if step_idx == 1 or step_idx % log_interval == 0 or step_idx == total_s1_batches:
+                ep_elapsed = time.perf_counter() - ep_t0
+                sec_per_step = ep_elapsed / float(step_idx)
+                eta_ep = sec_per_step * float(total_s1_batches - step_idx)
+                vram_now = (
+                    float(torch.cuda.max_memory_allocated(dev) / (1024.0 ** 2))
+                    if dev.type == "cuda"
+                    else 0.0
+                )
+                print(
+                    f"[Exp3 S1 Ep {epoch}/{epochs} | Step {step_idx}/{total_s1_batches} | "
+                    f"loss={running_total / step_idx:.4f} | {sec_per_step:.2f}s/step | "
+                    f"ETA {_format_eta(eta_ep)} | VRAM {vram_now:.0f}MB]",
+                    flush=True,
+                )
 
         first_g = group_specs[0][0]
         epoch_loss = running_total / max(1, n_batches)
+        val_s1 = _evaluate_dic_supcon_loss(
+            model=model,
+            val_loader=val_loader_s1,
+            supcon_criterion=supcon_criterion,
+            exit_weights=exit_weights,
+            exit_layers=sorted_exits,
+            num_classes=num_classes,
+            smoothing_coeff=smoothing_coeff,
+            device=dev,
+            use_amp=use_amp,
+            amp_dtype=amp_dt,
+            eval_seed=seed + 10000,
+        )
         epoch_rec = {
             "epoch": epoch,
             "train_total_loss": epoch_loss,
             "train_exit_losses": {str(l): running_per_exit[l] / max(1, n_batches) for l in sorted_exits},
+            "val_total_loss": val_s1["total_loss"],
+            "val_exit_losses": val_s1["exit_losses"],
             "lr": float(scheds[first_g].get_last_lr()[0]) if first_g in scheds else lr,
+            "epoch_sec": float(time.perf_counter() - ep_t0),
         }
         epoch_logs.append(epoch_rec)
-        if epoch_loss <= best_s1_loss:
-            best_s1_loss = epoch_loss
+        if val_s1["total_loss"] <= best_s1_val_loss:
+            best_s1_val_loss = val_s1["total_loss"]
             _save_checkpoint_atomic(model.state_dict(), s1_best_ckpt)
         _save_checkpoint_atomic(
             {
                 "epoch": epoch,
-                "stage1_done": False,
+                "stage1_done": epoch >= epochs,
                 "global_step": global_step,
-                "best_s1_loss": best_s1_loss,
+                "best_s1_val_loss": best_s1_val_loss,
                 "model_state_dict": model.state_dict(),
                 "opt_state_dicts": {gn: bo.state_dict() for gn, bo in base_opts.items()},
                 "sched_state_dicts": {gn: sc.state_dict() for gn, sc in scheds.items()},
@@ -1501,10 +1860,16 @@ def run_exp3_groupwise(
                 "step_logs": prober.history,
                 "landscape": None,
                 "elapsed_sec": elapsed_prior + float(time.perf_counter() - t0),
+                "rng_state": _capture_rng_state(),
             },
             s1_ckpt,
         )
-        print(f"[Exp3 6-Group Recompute Stage1] Epoch {epoch}/{epochs} loss={epoch_loss:.4f} best={best_s1_loss:.4f}")
+        print(
+            f"[Exp3 6-Group Recompute Stage1] Epoch {epoch}/{epochs} "
+            f"train={epoch_loss:.4f} val={val_s1['total_loss']:.4f} "
+            f"best_val={best_s1_val_loss:.4f} time={_format_eta(epoch_rec['epoch_sec'])}",
+            flush=True,
+        )
 
     for p in all_stage1_params:
         p.requires_grad = True
@@ -1545,24 +1910,36 @@ def run_exp3_groupwise(
             span=landscape_span,
             seed=seed,
         )
-    _save_checkpoint_atomic(
-        {
-            "epoch": epochs,
-            "stage1_done": True,
-            "global_step": global_step,
-            "best_s1_loss": best_s1_loss,
-            "model_state_dict": model.state_dict(),
-            "epoch_logs": epoch_logs,
-            "step_logs": prober.history,
-            "landscape": landscape,
-            "elapsed_sec": elapsed_prior + float(time.perf_counter() - t0),
-        },
-        s1_ckpt,
-    )
+    if not s1_ckpt.exists():
+        _save_checkpoint_atomic(
+            {
+                "epoch": epochs,
+                "stage1_done": True,
+                "global_step": global_step,
+                "best_s1_val_loss": best_s1_val_loss,
+                "model_state_dict": model.state_dict(),
+                "epoch_logs": epoch_logs,
+                "step_logs": prober.history,
+                "landscape": landscape,
+                "elapsed_sec": elapsed_prior + float(time.perf_counter() - t0),
+                "rng_state": _capture_rng_state(),
+            },
+            s1_ckpt,
+        )
+    elif landscape is not None:
+        ck_keep = torch.load(s1_ckpt, map_location="cpu", weights_only=False)
+        ck_keep["landscape"] = landscape
+        ck_keep["stage1_done"] = True
+        _save_checkpoint_atomic(ck_keep, s1_ckpt)
 
     stage2_logs: List[Dict[str, Any]] = []
     bs2 = batch_size_stage2 if batch_size_stage2 is not None else batch_size
-    if run_stage2_probe and epochs_stage2 > 0:
+    if want_stage2:
+        if not (resume and s2_ckpt.exists()):
+            src_s1 = s1_best_ckpt if (stage1_ckpt_for_stage2 == "best" and s1_best_ckpt.exists()) else s1_final_ckpt
+            if src_s1.exists():
+                model.load_state_dict(torch.load(src_s1, map_location=dev, weights_only=False))
+                print(f"[Exp3 Groupwise Stage2] Loaded Stage 1 weights from {src_s1}", flush=True)
         train_loader_s2, val_loader_s2 = _build_loaders(
             data_dir=data_dir,
             batch_size=bs2,
@@ -1596,10 +1973,11 @@ def run_exp3_groupwise(
             stage2_logs = list(ck2.get("stage2_logs", []))
             best_val_acc2 = float(ck2.get("best_val_acc", -1.0))
             elapsed_prior = max(elapsed_prior, float(ck2.get("elapsed_sec", 0.0)))
+            _restore_rng_state(ck2.get("rng_state"))
             model.freeze_encoder()
             model.train()
             model.backbone.eval()
-            print(f"[Exp3 Groupwise Stage2] Resumed from {s2_ckpt} at epoch {start_ep2}/{epochs_stage2}")
+            print(f"[Exp3 Groupwise Stage2] Resumed from {s2_ckpt} at epoch {start_ep2}/{epochs_stage2}", flush=True)
 
         for ep2 in range(start_ep2, epochs_stage2 + 1):
             opt2.zero_grad(set_to_none=True)
@@ -1643,6 +2021,7 @@ def run_exp3_groupwise(
                     "stage2_logs": stage2_logs,
                     "best_val_acc": best_val_acc2,
                     "elapsed_sec": elapsed_prior + float(time.perf_counter() - t0),
+                    "rng_state": _capture_rng_state(),
                 },
                 s2_ckpt,
             )
@@ -1650,7 +2029,8 @@ def run_exp3_groupwise(
                 f"[Exp3 Groupwise Stage2 Probe] Epoch {ep2}/{epochs_stage2} "
                 f"ce={tot_ce / max(1, nb2):.4f} "
                 f"L{sorted_exits[0]}={val_metrics['accuracy'][str(sorted_exits[0])]:.2f}% "
-                f"L{sorted_exits[-1]}={val_l12:.2f}%"
+                f"L{sorted_exits[-1]}={val_l12:.2f}%",
+                flush=True,
             )
 
     wall_time = elapsed_prior + float(time.perf_counter() - t0)
