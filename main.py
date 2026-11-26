@@ -96,6 +96,67 @@ def _run_standard_train(args: argparse.Namespace) -> None:
     if args.dry_run:
         train_loader_s1, train_loader_s2 = create_dry_run_loaders()
         val_loader = train_loader_s2
+    elif (Path(args.data_dir) / "ocr_cache" / "train.jsonl").exists():
+        from torch.utils.data import DataLoader
+        from data_processing import MultimodalCollator, PKBatchSampler, RVLCDIPCachedDataset
+
+        collator = MultimodalCollator(max_length=512)
+        pin = torch.cuda.is_available()
+        s1_sampler = _arg(args, "s1_sampler", None, s1_def.sampler)
+        s1_pk_p = _arg(args, "s1_pk_p", None, s1_def.pk_p)
+        s1_pk_k = _arg(args, "s1_pk_k", None, s1_def.pk_k)
+
+        ds_s1 = RVLCDIPCachedDataset(
+            data_dir=args.data_dir,
+            split="train",
+            transform=aug_tf,
+            is_contrastive=True,
+            max_samples=args.max_samples,
+        )
+        if s1_sampler == "pk" and len(ds_s1) > 0:
+            pk = PKBatchSampler([int(r["label"]) for r in ds_s1.records], p=s1_pk_p, k=s1_pk_k, seed=args.seed)
+            train_loader_s1 = DataLoader(ds_s1, batch_sampler=pk, num_workers=args.num_workers, collate_fn=collator, pin_memory=pin)
+        else:
+            train_loader_s1 = DataLoader(
+                ds_s1,
+                batch_size=s1_batch_size,
+                shuffle=True,
+                num_workers=args.num_workers,
+                collate_fn=collator,
+                pin_memory=pin,
+                drop_last=len(ds_s1) >= s1_batch_size,
+            )
+
+        ds_s2 = RVLCDIPCachedDataset(
+            data_dir=args.data_dir,
+            split="train",
+            transform=aug_tf if s2_use_aug else None,
+            is_contrastive=False,
+            max_samples=args.max_samples,
+        )
+        ds_val = RVLCDIPCachedDataset(
+            data_dir=args.data_dir,
+            split="val",
+            transform=None,
+            is_contrastive=False,
+            max_samples=args.max_samples,
+        )
+        train_loader_s2 = DataLoader(
+            ds_s2,
+            batch_size=s2_batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            collate_fn=collator,
+            pin_memory=pin,
+        )
+        val_loader = DataLoader(
+            ds_val,
+            batch_size=s2_eval_bs,
+            shuffle=False,
+            num_workers=args.num_workers,
+            collate_fn=collator,
+            pin_memory=pin,
+        )
     else:
         train_loader_s1 = build_dataloader(
             data_dir=args.data_dir,
@@ -148,51 +209,151 @@ def _run_standard_train(args: argparse.Namespace) -> None:
     )
 
 
-def _run_standard_eval(args: argparse.Namespace) -> None:
-    from model.DIC_without_groupwise import DICWithoutGroupwise
-    from train_test.evaluate import EarlyExitEvaluator
-    from utils.dataloader import build_dataloader
+def _resolve_sub_dir(args: argparse.Namespace, attr: str, default_sub: str) -> str:
+    val = getattr(args, attr, None)
+    default_path = f"outputs/{default_sub}"
+    out_root = getattr(args, "output_dir", "outputs")
+    if val is None or (val == default_path and out_root != "outputs"):
+        return str(Path(out_root) / default_sub)
+    return str(val)
+
+
+def _pick_checkpoint(exp_dir: str) -> str:
+    root = Path(exp_dir)
+    best = root / "model_best.pt"
+    if best.exists():
+        return str(best)
+    return str(root / "model_final.pt")
+
+
+def _run_eval_for_checkpoint(
+    args: argparse.Namespace,
+    checkpoint_path: str,
+    eval_out_dir: str,
+    model_type: str = "auto",
+) -> dict[str, Any]:
+    import json
+    from train_test.evaluate import (
+        EarlyExitEvaluator,
+        build_cached_eval_loader,
+        load_model_for_evaluation,
+    )
+
+    out_dir_path = Path(eval_out_dir)
+    report_file = out_dir_path / "eval_report.json"
+    if _arg(args, "resume", None, True) and report_file.exists():
+        print(f"[Eval:{model_type}] Already completed at {report_file}, loading saved report.")
+        return json.loads(report_file.read_text(encoding="utf-8"))
 
     s2_def = Stage2ClassifierConfig()
     eval_bs = _arg(args, "s2_eval_batch_size", "batch_size", s2_def.eval_batch_size)
+    calibrate = _arg(args, "calibrate", None, s2_def.calibrate_temperature)
+    epsilon = _arg(args, "epsilon", None, 0.1)
+    benchmark_latency = _arg(args, "benchmark_latency", None, False)
 
-    model = DICWithoutGroupwise(num_classes=args.num_classes, exit_layers=args.exit_layers)
-    ckpt_path = Path(args.checkpoint_path)
-    if ckpt_path.exists():
-        ckpt = torch.load(ckpt_path, map_location=args.device, weights_only=False)
-        state_dict = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
-        model.load_state_dict(state_dict, strict=False)
+    model, resolved_type = load_model_for_evaluation(
+        model_type=model_type,
+        checkpoint_path=checkpoint_path,
+        num_classes=args.num_classes,
+        exit_layers=args.exit_layers,
+        device=args.device,
+    )
 
-    evaluator = EarlyExitEvaluator(model=model, exit_layers=args.exit_layers, device=args.device)
+    evaluator = EarlyExitEvaluator(
+        model=model,
+        exit_layers=args.exit_layers,
+        device=args.device,
+        use_amp=args.use_amp,
+    )
     if args.dry_run:
-        dataloader = [
+        dummy_loader = [
             {
                 "pixel_values": torch.randn(4, 3, 224, 224),
-                "input_ids": torch.zeros((4, 16), dtype=torch.long),
+                "input_ids": torch.randint(0, 1000, (4, 16), dtype=torch.long),
                 "bbox": torch.zeros((4, 16, 4), dtype=torch.long),
+                "attention_mask": torch.ones((4, 16), dtype=torch.long),
                 "labels": torch.tensor([0, 5, 10, 15]),
             }
         ]
+        val_loader = dummy_loader if calibrate else None
+        test_loader = dummy_loader
     else:
-        dataloader = build_dataloader(
+        val_loader = (
+            build_cached_eval_loader(
+                data_dir=args.data_dir,
+                split="val",
+                batch_size=eval_bs,
+                num_workers=args.num_workers,
+                max_samples=args.max_samples,
+            )
+            if calibrate
+            else None
+        )
+        test_loader = build_cached_eval_loader(
             data_dir=args.data_dir,
             split="test",
             batch_size=eval_bs,
-            is_contrastive=False,
-            shuffle=False,
+            num_workers=args.num_workers,
+            max_samples=args.max_samples,
         )
 
-    all_logits, all_labels = evaluator.collect_all_logits(dataloader)
-    static_results = evaluator.evaluate_static_exits(all_logits, all_labels)
-    for l, m in static_results.items():
-        print(f"Exit L{l:2d}: Acc={m['accuracy']:.2f}% | Conf={m['avg_confidence']:.4f} | Ent={m['avg_entropy']:.4f}")
+    report = evaluator.run_full_evaluation(
+        test_loader=test_loader,
+        val_loader=val_loader,
+        criterion=args.criterion,
+        threshold=args.threshold,
+        epsilon=epsilon,
+        calibrate=calibrate,
+        output_dir=eval_out_dir,
+        benchmark_latency=benchmark_latency,
+    )
+
+    print(f"[Model={resolved_type}] Evaluated {report['num_test_samples']} samples.")
+    for l_str, m in report["uncalibrated"]["static"].items():
+        print(
+            f"Exit L{int(l_str):2d} [Uncal]: Acc={m['accuracy']:.2f}% | F1={m['f1_macro']:.4f} "
+            f"| ECE={m['ece']:.4f} | NLL={m['nll']:.4f} | AURC={m['aurc']:.4f}"
+        )
     if args.sweep:
-        sweep_data = evaluator.sweep_thresholds(all_logits, all_labels, criterion=args.criterion)
-        for s in sweep_data:
-            print(f"t={s['threshold']:.2f} | Acc={s['adaptive_accuracy']:.2f}% | AvgL={s['avg_exit_layer']:.2f} | Saved={s['compute_saved_percent']:.2f}%")
+        sweep_src = report.get("calibrated", report["uncalibrated"])["global_sweep"]
+        tag = "Cal" if "calibrated" in report else "Uncal"
+        for s in sweep_src:
+            print(
+                f"[{tag}] t={s['threshold']:.2f} | Acc={s['adaptive_accuracy']:.2f}% "
+                f"| ECE={s['ece']:.4f} | AvgL={s['avg_exit_layer']:.2f} "
+                f"| ParamsSaved={s['params_reduction']:.2f}% | RelLatSaved={s['relative_latency_reduction']:.2f}%"
+            )
     else:
-        res = evaluator.evaluate_adaptive_inference(all_logits, all_labels, criterion=args.criterion, threshold=args.threshold)
-        print(f"Adaptive Acc={res['adaptive_accuracy']:.2f}% | AvgL={res['avg_exit_layer']:.2f} | Saved={res['compute_saved_percent']:.2f}%")
+        single = report.get("calibrated", report["uncalibrated"])["single_threshold"]
+        print(
+            f"Adaptive Acc={single['adaptive_accuracy']:.2f}% | ECE={single['ece']:.4f} "
+            f"| AvgL={single['avg_exit_layer']:.2f} | ParamsSaved={single['params_reduction']:.2f}%"
+        )
+    if "calibrated" in report:
+        h = report["calibrated"]["heuristic"]
+        print(
+            f"[Cal Heuristic eps={h['epsilon']:.2f}] Acc={h['adaptive_accuracy']:.2f}% "
+            f"| ECE={h['ece']:.4f} | ParamsSaved={h['params_reduction']:.2f}% "
+            f"| RelLatSaved={h['relative_latency_reduction']:.2f}%"
+        )
+    if "latency_benchmark" in report:
+        lb = report["latency_benchmark"]
+        print(
+            f"[True Latency] Full={lb['full_ms_per_sample']:.2f}ms -> EE={lb['ee_ms_per_sample']:.2f}ms "
+            f"(Speedup={lb['wall_clock_speedup_percent']:.2f}%)"
+        )
+    if "artifacts" in report:
+        print(f"Saved evaluation report & Pareto plots to: {report['artifacts']['report_json']}")
+    return report
+
+
+def _run_standard_eval(args: argparse.Namespace) -> None:
+    _run_eval_for_checkpoint(
+        args=args,
+        checkpoint_path=args.checkpoint_path,
+        eval_out_dir=_resolve_sub_dir(args, "eval_output_dir", "eval"),
+        model_type=_arg(args, "model_type", None, "auto"),
+    )
 
 
 def _run_exp1_from_args(args: argparse.Namespace) -> None:
@@ -201,7 +362,7 @@ def _run_exp1_from_args(args: argparse.Namespace) -> None:
     ee_def = EEBaselineConfig()
     run_exp1_hamed_ce(
         data_dir=args.data_dir,
-        output_dir=args.exp1_dir,
+        output_dir=_resolve_sub_dir(args, "exp1_dir", "exp1_hamed_ce"),
         exit_layers=args.exit_layers,
         num_classes=args.num_classes,
         weighting_mode=_arg(args, "ee_weighting_mode", "weighting_mode", ee_def.weighting_mode),
@@ -225,6 +386,7 @@ def _run_exp1_from_args(args: argparse.Namespace) -> None:
         use_amp=args.use_amp,
         use_checkpointing=args.use_checkpointing,
         dry_run=args.dry_run,
+        resume=_arg(args, "resume", None, True),
     )
 
 
@@ -235,7 +397,7 @@ def _run_exp2_from_args(args: argparse.Namespace) -> None:
     s2_def = Stage2ClassifierConfig()
     run_exp2_supcon(
         data_dir=args.data_dir,
-        output_dir=args.exp2_dir,
+        output_dir=_resolve_sub_dir(args, "exp2_dir", "exp2_supcon"),
         exit_layers=args.exit_layers,
         num_classes=args.num_classes,
         weighting_mode=_arg(args, "s1_exit_weighting", "weighting_mode", s1_def.exit_weighting),
@@ -283,7 +445,124 @@ def _run_exp2_from_args(args: argparse.Namespace) -> None:
         use_checkpointing=args.use_checkpointing,
         dry_run=args.dry_run,
         run_stage2_probe=args.run_stage2_probe,
+        resume=_arg(args, "resume", None, True),
     )
+
+
+def _run_exp3_from_args(args: argparse.Namespace) -> None:
+    from train_test.exp_runner import run_exp3_groupwise
+
+    s1_def = Stage1SupConConfig()
+    s2_def = Stage2ClassifierConfig()
+    run_exp3_groupwise(
+        data_dir=args.data_dir,
+        output_dir=_resolve_sub_dir(args, "exp3_dir", "exp3_groupwise"),
+        exit_layers=args.exit_layers,
+        num_classes=args.num_classes,
+        weighting_mode=_arg(args, "s1_exit_weighting", "weighting_mode", s1_def.exit_weighting),
+        gamma=_arg(args, "s1_gamma", "gamma", s1_def.gamma),
+        batch_size=_arg(args, "s1_batch_size", "batch_size", s1_def.batch_size),
+        grad_accum_steps=_arg(args, "s1_grad_accum_steps", "grad_accum_steps", s1_def.grad_accum_steps),
+        sampler=_arg(args, "s1_sampler", None, s1_def.sampler),
+        pk_p=_arg(args, "s1_pk_p", None, s1_def.pk_p),
+        pk_k=_arg(args, "s1_pk_k", None, s1_def.pk_k),
+        epochs=_arg(args, "s1_epochs", "epochs", s1_def.epochs),
+        lr=_arg(args, "s1_lr", "lr", s1_def.lr),
+        weight_decay=_arg(args, "s1_weight_decay", "weight_decay", s1_def.weight_decay),
+        exclude_bias_norm=_arg(args, "s1_exclude_bias_norm", None, s1_def.exclude_bias_norm),
+        warmup_ratio=_arg(args, "s1_warmup_ratio", "warmup_ratio", s1_def.warmup_ratio),
+        warmup_start_lr_ratio=_arg(args, "s1_warmup_start_lr_ratio", None, s1_def.warmup_start_lr_ratio),
+        eta_min_ratio=_arg(args, "s1_eta_min_ratio", None, s1_def.eta_min),
+        temperature=_arg(args, "s1_temperature", "temperature", s1_def.temperature),
+        base_temperature=_arg(args, "s1_base_temperature", None, s1_def.base_temperature),
+        smoothing_coeff=_arg(args, "s1_smoothing_coeff", "smoothing_coeff", s1_def.smoothing_coeff),
+        use_lars=_arg(args, "s1_use_lars", "use_lars", s1_def.use_lars),
+        lars_eta=_arg(args, "s1_lars_eta", None, s1_def.lars_eta),
+        max_grad_norm=_arg(args, "s1_max_grad_norm", None, s1_def.max_grad_norm),
+        max_shear=_arg(args, "s1_max_shear", None, s1_def.max_shear),
+        brightness_range=s1_def.brightness_range,
+        p_blur=_arg(args, "s1_p_blur", None, s1_def.p_blur),
+        blur_sigma=s1_def.blur_sigma,
+        noise_std=_arg(args, "s1_noise_std", None, s1_def.noise_std),
+        p_erase=_arg(args, "s1_p_erase", None, s1_def.p_erase),
+        epochs_stage2=_arg(args, "s2_epochs", "epochs_stage2", s2_def.epochs),
+        batch_size_stage2=_arg(args, "s2_batch_size", "batch_size", s2_def.batch_size),
+        eval_batch_size=_arg(args, "s2_eval_batch_size", None, s2_def.eval_batch_size),
+        grad_accum_steps_stage2=_arg(args, "s2_grad_accum_steps", "grad_accum_steps", s2_def.grad_accum_steps),
+        lr_stage2=_arg(args, "s2_lr", "lr_stage2", s2_def.lr),
+        weight_decay_stage2=_arg(args, "s2_weight_decay", "weight_decay", s2_def.weight_decay),
+        label_smoothing_stage2=_arg(args, "s2_label_smoothing", None, s2_def.label_smoothing),
+        use_aug_stage2=_arg(args, "s2_use_aug", None, s2_def.use_augmentation),
+        probe_every_n_steps=args.probe_every_n_steps,
+        landscape_grid_size=args.landscape_grid_size,
+        landscape_span=args.landscape_span,
+        max_samples=args.max_samples,
+        num_workers=args.num_workers,
+        seed=args.seed,
+        device=args.device,
+        use_amp=args.use_amp,
+        use_checkpointing=args.use_checkpointing,
+        dry_run=args.dry_run,
+        run_stage2_probe=args.run_stage2_probe,
+        resume=_arg(args, "resume", None, True),
+    )
+
+
+def _run_all_from_args(args: argparse.Namespace) -> None:
+    import json
+    from train_test.plot_gradient_conflict import generate_all_visualizations
+
+    if not args.dry_run and not (Path(args.data_dir) / "ocr_cache" / "train.jsonl").exists():
+        from data_processing.prepare_rvl_subset import prepare_rvl_cdip_subset
+
+        counts = prepare_rvl_cdip_subset(
+            output_dir=args.data_dir,
+            dataset_name=args.dataset_name,
+            ocr_engine=args.ocr_engine,
+            max_samples_per_split=args.max_samples,
+            seed=args.seed,
+        )
+        print(f"Prepared dataset at {args.data_dir}: {counts}")
+
+    exp1_dir = _resolve_sub_dir(args, "exp1_dir", "exp1_hamed_ce")
+    exp2_dir = _resolve_sub_dir(args, "exp2_dir", "exp2_supcon")
+    exp3_dir = _resolve_sub_dir(args, "exp3_dir", "exp3_groupwise")
+    figures_dir = _resolve_sub_dir(args, "figures_dir", "figures")
+    eval_root = Path(_resolve_sub_dir(args, "eval_output_dir", "eval"))
+
+    _run_exp1_from_args(args)
+    _run_exp2_from_args(args)
+    _run_exp3_from_args(args)
+
+    generate_all_visualizations(
+        exp1_log_path=exp1_dir,
+        exp2_log_path=exp2_dir,
+        output_dir=figures_dir,
+    )
+
+    eval_summary: dict[str, Any] = {}
+    for name, ed, mtype in (
+        ("exp1_hamed_ce", exp1_dir, "ee_hamed"),
+        ("exp2_supcon", exp2_dir, "dic"),
+        ("exp3_groupwise", exp3_dir, "dic_groupwise"),
+    ):
+        ckpt = _pick_checkpoint(ed)
+        if Path(ckpt).exists():
+            rep = _run_eval_for_checkpoint(
+                args=args,
+                checkpoint_path=ckpt,
+                eval_out_dir=str(eval_root / name),
+                model_type=mtype,
+            )
+            eval_summary[name] = {
+                "checkpoint": ckpt,
+                "uncalibrated_l12_acc": rep["uncalibrated"]["static"][str(max(args.exit_layers))]["accuracy"],
+                "calibrated_heuristic": rep.get("calibrated", {}).get("heuristic", {}),
+            }
+    eval_root.mkdir(parents=True, exist_ok=True)
+    summary_path = eval_root / "all_models_summary.json"
+    summary_path.write_text(json.dumps(eval_summary, indent=2), encoding="utf-8")
+    print(f"[run_all] Full thesis pipeline finished. Consolidated eval summary: {summary_path}")
 
 
 def main_app(args: argparse.Namespace) -> None:
@@ -302,23 +581,27 @@ def main_app(args: argparse.Namespace) -> None:
         _run_exp1_from_args(args)
     elif args.mode == "exp2_supcon":
         _run_exp2_from_args(args)
+    elif args.mode == "exp3_groupwise":
+        _run_exp3_from_args(args)
     elif args.mode == "run_both":
         from train_test.plot_gradient_conflict import generate_all_visualizations
 
         _run_exp1_from_args(args)
         _run_exp2_from_args(args)
         generate_all_visualizations(
-            exp1_log_path=args.exp1_dir,
-            exp2_log_path=args.exp2_dir,
-            output_dir=args.figures_dir,
+            exp1_log_path=_resolve_sub_dir(args, "exp1_dir", "exp1_hamed_ce"),
+            exp2_log_path=_resolve_sub_dir(args, "exp2_dir", "exp2_supcon"),
+            output_dir=_resolve_sub_dir(args, "figures_dir", "figures"),
         )
+    elif args.mode == "run_all":
+        _run_all_from_args(args)
     elif args.mode == "visualize_all":
         from train_test.plot_gradient_conflict import generate_all_visualizations
 
         res = generate_all_visualizations(
-            exp1_log_path=args.exp1_dir,
-            exp2_log_path=args.exp2_dir,
-            output_dir=args.figures_dir,
+            exp1_log_path=_resolve_sub_dir(args, "exp1_dir", "exp1_hamed_ce"),
+            exp2_log_path=_resolve_sub_dir(args, "exp2_dir", "exp2_supcon"),
+            output_dir=_resolve_sub_dir(args, "figures_dir", "figures"),
         )
         print(f"Saved figures and summary tables to: {res['output_dir']}")
     elif args.mode == "train_standard":
@@ -339,11 +622,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mode",
         type=str,
-        default="prepare_data",
+        default="run_all",
         choices=[
+            "run_all",            # Chạy trọn bộ bài: auto prepare_data -> exp1 -> exp2 -> exp3 -> visualize -> eval 3 model (có --resume)
             "prepare_data",       # Tải RVL-CDIP subset + chạy OCR & lưu cache vào data_dir
             "exp1_hamed_ce",      # Chạy baseline EE gốc (Hamed et al., CE) + đo gradient conflict
             "exp2_supcon",        # Chạy without-groupwise SupCon-ST + Stage 2 probe + đo gradient conflict
+            "exp3_groupwise",     # Chạy group-wise SupCon-ST (Group 1 [0,1,4] & Group 2 [8,10,12]) + Stage 2 probe
             "run_both",           # Chạy tuần tự exp1_hamed_ce -> exp2_supcon -> visualize_all
             "visualize_all",      # Vẽ 6 biểu đồ & bảng summary từ log JSON có sẵn (không train lại)
             "train_standard",     # Chạy DICTrainer chuẩn 2 stage theo --train_type (lưu vào --save_dir)
@@ -354,6 +639,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output_dir", type=str, default="outputs")
     parser.add_argument("--exp1_dir", type=str, default="outputs/exp1_hamed_ce")
     parser.add_argument("--exp2_dir", type=str, default="outputs/exp2_supcon")
+    parser.add_argument("--exp3_dir", type=str, default="outputs/exp3_groupwise")
     parser.add_argument("--figures_dir", type=str, default="outputs/figures")
 
     parser.add_argument("--dataset_name", type=str, default="jordyvl/rvl_cdip_100_examples_per_class")
@@ -426,13 +712,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use_checkpointing", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--dry_run", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--run_stage2_probe", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--train_type", type=str, default="without_groupwise", choices=["without_groupwise", "groupwise"])
     parser.add_argument("--save_dir", type=str, default="checkpoints/run_01")
-    parser.add_argument("--checkpoint_path", type=str, default="checkpoints/run_01/best_model.pt")
+    parser.add_argument("--checkpoint_path", type=str, default="outputs/exp2_supcon/model_final.pt")
+    parser.add_argument("--model_type", type=str, default="auto", choices=["auto", "dic", "dic_groupwise", "ee_hamed"])
+    parser.add_argument("--eval_output_dir", type=str, default="outputs/eval")
     parser.add_argument("--criterion", type=str, default="max_confidence", choices=["max_confidence", "entropy", "top12_margin"])
     parser.add_argument("--threshold", type=float, default=0.8)
-    parser.add_argument("--sweep", action="store_true", default=False)
+    parser.add_argument("--epsilon", type=float, default=0.1)
+    parser.add_argument("--calibrate", action=argparse.BooleanOptionalAction, default=s2_def.calibrate_temperature)
+    parser.add_argument("--benchmark_latency", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--sweep", action=argparse.BooleanOptionalAction, default=True)
 
     return parser
 

@@ -1074,6 +1074,110 @@ class LayoutLMv3Backbone(nn.Module):
     ) -> Dict[int, torch.Tensor]:
         return {layer: self.extract_cls_at_layer(hidden_states, layer) for layer in exit_layers}
 
+    def forward_early_exit(
+        self,
+        input_ids: torch.Tensor,
+        bbox: torch.Tensor,
+        pixel_values: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        exit_layers: Sequence[int],
+        exit_fn: Any,
+    ) -> Tuple[torch.Tensor, int]:
+        """
+        True Anytime Early-Exit forward pass: computes embeddings once and stops
+        executing subsequent Transformer layers as soon as `exit_fn(layer, feat)`
+        returns `(logits, True)`.
+        """
+        m = self.model
+        cfg = m.config
+        sorted_exits = sorted(int(l) for l in exit_layers)
+        exit_set = set(sorted_exits)
+        final_layer = sorted_exits[-1]
+
+        input_shape = input_ids.size()
+        batch_size, seq_length = input_shape
+        device = input_ids.device
+
+        if attention_mask is None:
+            attention_mask = torch.ones((batch_size, seq_length), device=device)
+        token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
+        if bbox is None:
+            bbox = torch.zeros((batch_size, seq_length, 4), dtype=torch.long, device=device)
+
+        embedding_output = m.embeddings(
+            input_ids=input_ids,
+            bbox=bbox,
+            position_ids=None,
+            token_type_ids=token_type_ids,
+            inputs_embeds=None,
+        )
+
+        final_bbox = final_position_ids = None
+        patch_height = patch_width = None
+        if pixel_values is not None:
+            patch_height = int(pixel_values.shape[2] / cfg.patch_size)
+            patch_width = int(pixel_values.shape[3] / cfg.patch_size)
+            visual_embeddings = m.forward_image(pixel_values)
+            visual_attention_mask = torch.ones(
+                (batch_size, visual_embeddings.shape[1]), dtype=torch.long, device=device
+            )
+            attention_mask = torch.cat([attention_mask, visual_attention_mask], dim=1)
+
+            if cfg.has_relative_attention_bias or cfg.has_spatial_attention_bias:
+                if cfg.has_spatial_attention_bias:
+                    visual_bbox = m.calculate_visual_bbox(device, dtype=torch.long, batch_size=batch_size)
+                    final_bbox = torch.cat([bbox, visual_bbox], dim=1)
+                visual_position_ids = torch.arange(
+                    0, visual_embeddings.shape[1], dtype=torch.long, device=device
+                ).repeat(batch_size, 1)
+                text_pos_ids = torch.arange(0, input_shape[1], device=device).unsqueeze(0).expand(input_shape)
+                final_position_ids = torch.cat([text_pos_ids, visual_position_ids], dim=1)
+
+            embedding_output = torch.cat([embedding_output, visual_embeddings], dim=1)
+            embedding_output = m.LayerNorm(embedding_output)
+            embedding_output = m.dropout(embedding_output)
+        elif cfg.has_relative_attention_bias or cfg.has_spatial_attention_bias:
+            if cfg.has_spatial_attention_bias:
+                final_bbox = bbox
+            if cfg.has_relative_attention_bias:
+                final_position_ids = m.embeddings.position_ids[:, : input_shape[1]].expand_as(input_ids)
+
+        if 0 in exit_set:
+            logits_0, should_stop = exit_fn(0, embedding_output.mean(dim=1))
+            if should_stop or final_layer == 0:
+                return logits_0, 0
+
+        if create_bidirectional_mask is not None:
+            ext_mask = create_bidirectional_mask(
+                config=cfg,
+                inputs_embeds=embedding_output,
+                attention_mask=attention_mask,
+            )
+        else:
+            ext_mask = m.get_extended_attention_mask(attention_mask, None, device, dtype=embedding_output.dtype)
+
+        enc = m.encoder
+        rel_pos = enc._cal_1d_pos_emb(final_position_ids) if enc.has_relative_attention_bias else None
+        rel_2d_pos = enc._cal_2d_pos_emb(final_bbox) if enc.has_spatial_attention_bias else None
+
+        hidden_states = embedding_output
+        last_logits: Optional[torch.Tensor] = None
+        for layer_idx, layer_module in enumerate(enc.layer, start=1):
+            layer_out = layer_module(
+                hidden_states,
+                ext_mask,
+                rel_pos=rel_pos,
+                rel_2d_pos=rel_2d_pos,
+            )
+            hidden_states = layer_out[0] if isinstance(layer_out, tuple) else layer_out
+            if layer_idx in exit_set:
+                last_logits, should_stop = exit_fn(layer_idx, hidden_states[:, 0, :])
+                if should_stop or layer_idx == final_layer:
+                    return last_logits, layer_idx
+
+        assert last_logits is not None
+        return last_logits, final_layer
+
 
 if __name__ == "__main__":
     print("=" * 70)

@@ -4,6 +4,7 @@ import gc
 import itertools
 import json
 import math
+import os
 from pathlib import Path
 import random
 import time
@@ -21,6 +22,7 @@ from data_processing.data_processing import (
     get_smooth_labels,
     get_transforms,
 )
+from model.DIC import DIC
 from model.DIC_without_groupwise import DICWithoutGroupwise
 from model.modules.ee_modules import ExitConfig, compute_ece
 from model.modules.layoutlmv3 import LayoutLMv3EEForSequenceClassification
@@ -41,6 +43,43 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _save_checkpoint_atomic(state: Dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    torch.save(state, tmp_path)
+    os.replace(tmp_path, path)
+
+
+def _split_groupwise_named_params(
+    model: DIC,
+    split_layer: int = 4,
+) -> Tuple[List[Tuple[str, nn.Parameter]], List[Tuple[str, nn.Parameter]]]:
+    g1_named: List[Tuple[str, nn.Parameter]] = []
+    g2_named: List[Tuple[str, nn.Parameter]] = []
+    for name, param in model.named_parameters():
+        if name.startswith("exit_heads."):
+            continue
+        if name.startswith("projection_heads."):
+            parts = name.split(".")
+            layer_id = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 12
+            if layer_id <= split_layer:
+                g1_named.append((name, param))
+            else:
+                g2_named.append((name, param))
+            continue
+        if "encoder.layer." in name:
+            after = name.split("encoder.layer.", 1)[1]
+            idx_str = after.split(".", 1)[0]
+            layer_num = int(idx_str) + 1 if idx_str.isdigit() else 12
+            if layer_num <= split_layer:
+                g1_named.append((name, param))
+            else:
+                g2_named.append((name, param))
+        else:
+            g1_named.append((name, param))
+    return g1_named, g2_named
 
 
 def _resolve_device(device_str: str) -> torch.device:
@@ -413,12 +452,19 @@ def run_exp1_hamed_ce(
     use_amp: bool = True,
     use_checkpointing: bool = True,
     dry_run: bool = False,
+    resume: bool = True,
 ) -> Dict[str, Any]:
     set_seed(seed)
     dev = _resolve_device(device)
     amp_dt = _amp_dtype(dev)
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
+    log_file = out_path / "gradient_conflict_log.json"
+    final_ckpt = out_path / "model_final.pt"
+    last_ckpt = out_path / "checkpoint_last.pt"
+    if resume and log_file.exists() and final_ckpt.exists():
+        print(f"[Exp1 Hamed CE] Already completed at {out_path}, loading saved log.")
+        return json.loads(log_file.read_text(encoding="utf-8"))
 
     sorted_exits = sorted({int(l) for l in exit_layers})
     if not sorted_exits or any(l < 0 or l > 12 for l in sorted_exits):
@@ -486,9 +532,27 @@ def run_exp1_hamed_ce(
     t0 = time.perf_counter()
     epoch_logs: List[Dict[str, Any]] = []
     global_step = 0
+    start_epoch = 1
+    best_val_acc = -1.0
+    elapsed_prior = 0.0
+    if resume and last_ckpt.exists():
+        ck = torch.load(last_ckpt, map_location=dev, weights_only=False)
+        model.load_state_dict(ck["model_state_dict"])
+        optimizer.load_state_dict(ck["optimizer_state_dict"])
+        scheduler.load_state_dict(ck["scheduler_state_dict"])
+        if "scaler_state_dict" in ck and scaler.is_enabled():
+            scaler.load_state_dict(ck["scaler_state_dict"])
+        start_epoch = int(ck.get("epoch", 0)) + 1
+        global_step = int(ck.get("global_step", 0))
+        epoch_logs = list(ck.get("epoch_logs", []))
+        prober.history = list(ck.get("step_logs", []))
+        best_val_acc = float(ck.get("best_val_acc", -1.0))
+        elapsed_prior = float(ck.get("elapsed_sec", 0.0))
+        print(f"[Exp1 Hamed CE] Resumed from {last_ckpt} at epoch {start_epoch}/{epochs}")
+
     model.train()
 
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         optimizer.zero_grad(set_to_none=True)
         running_total = 0.0
         running_per_exit = {l: 0.0 for l in sorted_exits}
@@ -538,11 +602,30 @@ def run_exp1_hamed_ce(
             "lr": float(scheduler.get_last_lr()[0]),
         }
         epoch_logs.append(epoch_rec)
+        val_l12 = float(val_metrics["accuracy"][str(sorted_exits[-1])])
+        if val_l12 >= best_val_acc:
+            best_val_acc = val_l12
+            _save_checkpoint_atomic(model.state_dict(), out_path / "model_best.pt")
+        _save_checkpoint_atomic(
+            {
+                "epoch": epoch,
+                "global_step": global_step,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
+                "epoch_logs": epoch_logs,
+                "step_logs": prober.history,
+                "best_val_acc": best_val_acc,
+                "elapsed_sec": elapsed_prior + float(time.perf_counter() - t0),
+            },
+            last_ckpt,
+        )
         print(
             f"[Exp1 Hamed CE | {weighting_mode}] Epoch {epoch}/{epochs} "
             f"loss={epoch_rec['train_total_loss']:.4f} "
             f"L{sorted_exits[0]}={val_metrics['accuracy'][str(sorted_exits[0])]:.2f}% "
-            f"L{sorted_exits[-1]}={val_metrics['accuracy'][str(sorted_exits[-1])]:.2f}%"
+            f"L{sorted_exits[-1]}={val_l12:.2f}%"
         )
 
     del optimizer, scheduler, scaler
@@ -575,7 +658,7 @@ def run_exp1_hamed_ce(
         seed=seed,
     )
 
-    wall_time = float(time.perf_counter() - t0)
+    wall_time = elapsed_prior + float(time.perf_counter() - t0)
     peak_vram_mb = (
         float(torch.cuda.max_memory_allocated(dev) / (1024.0 ** 2))
         if dev.type == "cuda"
@@ -609,9 +692,8 @@ def run_exp1_hamed_ce(
         "peak_vram_mb": peak_vram_mb,
     }
 
-    log_file = out_path / "gradient_conflict_log.json"
     log_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    torch.save(model.state_dict(), out_path / "model_final.pt")
+    _save_checkpoint_atomic(model.state_dict(), final_ckpt)
     del model
     gc.collect()
     if dev.type == "cuda":
@@ -670,12 +752,20 @@ def run_exp2_supcon(
     use_checkpointing: bool = True,
     dry_run: bool = False,
     run_stage2_probe: bool = True,
+    resume: bool = True,
 ) -> Dict[str, Any]:
     set_seed(seed)
     dev = _resolve_device(device)
     amp_dt = _amp_dtype(dev)
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
+    log_file = out_path / "gradient_conflict_log.json"
+    final_ckpt = out_path / "model_final.pt"
+    s1_ckpt = out_path / "checkpoint_stage1_last.pt"
+    s2_ckpt = out_path / "checkpoint_stage2_last.pt"
+    if resume and log_file.exists() and final_ckpt.exists():
+        print(f"[Exp2 SupCon] Already completed at {out_path}, loading saved log.")
+        return json.loads(log_file.read_text(encoding="utf-8"))
 
     sorted_exits = sorted({int(l) for l in exit_layers})
     if not sorted_exits or any(l < 0 or l > 12 for l in sorted_exits):
@@ -765,10 +855,30 @@ def run_exp2_supcon(
     t0 = time.perf_counter()
     epoch_logs: List[Dict[str, Any]] = []
     global_step = 0
+    start_epoch = 1
+    stage1_done = False
+    landscape: Optional[Dict[str, Any]] = None
+    elapsed_prior = 0.0
+    if resume and s1_ckpt.exists():
+        ck1 = torch.load(s1_ckpt, map_location=dev, weights_only=False)
+        model.load_state_dict(ck1["model_state_dict"])
+        base_opt.load_state_dict(ck1["optimizer_state_dict"])
+        scheduler.load_state_dict(ck1["scheduler_state_dict"])
+        if "scaler_state_dict" in ck1 and scaler.is_enabled():
+            scaler.load_state_dict(ck1["scaler_state_dict"])
+        start_epoch = int(ck1.get("epoch", 0)) + 1
+        global_step = int(ck1.get("global_step", 0))
+        epoch_logs = list(ck1.get("epoch_logs", []))
+        prober.history = list(ck1.get("step_logs", []))
+        stage1_done = bool(ck1.get("stage1_done", False))
+        landscape = ck1.get("landscape")
+        elapsed_prior = float(ck1.get("elapsed_sec", 0.0))
+        print(f"[Exp2 SupCon Stage1] Resumed from {s1_ckpt} (start_epoch={start_epoch}/{epochs}, stage1_done={stage1_done})")
+
     model.unfreeze_encoder()
     model.train()
 
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         optimizer.zero_grad(set_to_none=True)
         running_total = 0.0
         running_per_exit = {l: 0.0 for l in sorted_exits}
@@ -824,6 +934,22 @@ def run_exp2_supcon(
             "lr": float(scheduler.get_last_lr()[0]),
         }
         epoch_logs.append(epoch_rec)
+        _save_checkpoint_atomic(
+            {
+                "epoch": epoch,
+                "stage1_done": False,
+                "global_step": global_step,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": base_opt.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
+                "epoch_logs": epoch_logs,
+                "step_logs": prober.history,
+                "landscape": None,
+                "elapsed_sec": elapsed_prior + float(time.perf_counter() - t0),
+            },
+            s1_ckpt,
+        )
         print(
             f"[Exp2 SupCon Stage1 | {weighting_mode}] Epoch {epoch}/{epochs} "
             f"loss={epoch_rec['train_total_loss']:.4f}"
@@ -834,39 +960,56 @@ def run_exp2_supcon(
     if dev.type == "cuda":
         torch.cuda.empty_cache()
 
-    probe_batches = list(itertools.islice(val_loader_s1, 2))
+    if landscape is None:
+        probe_batches = list(itertools.islice(val_loader_s1, 2))
 
-    def _eval_landscape_losses() -> Dict[int, torch.Tensor]:
-        acc_losses: Dict[int, List[torch.Tensor]] = {l: [] for l in sorted_exits}
-        for b in probe_batches:
-            labels = b["labels"].to(dev, non_blocking=True)
-            soft_targets = get_smooth_labels(
-                labels,
-                classid_list=num_classes,
-                smoothing_coeff=smoothing_coeff,
-            ).to(dev)
-            v1 = _move_view(b["view1"], dev)
-            v2 = _move_view(b["view2"], dev)
-            with torch.amp.autocast("cuda", dtype=amp_dt, enabled=use_amp and dev.type == "cuda"):
-                o1 = model(**v1, compute_projections=True, compute_logits=False)
-                o2 = model(**v2, compute_projections=True, compute_logits=False)
-            p1_f32 = {l: t.float() for l, t in o1.projections_dict.items()}
-            p2_f32 = {l: t.float() for l, t in o2.projections_dict.items()}
-            l_dict = supcon_criterion((p1_f32, p2_f32), soft_targets)
-            for l in sorted_exits:
-                acc_losses[l].append(l_dict[l])
-        return {l: torch.stack(acc_losses[l]).mean() for l in sorted_exits}
+        def _eval_landscape_losses() -> Dict[int, torch.Tensor]:
+            acc_losses: Dict[int, List[torch.Tensor]] = {l: [] for l in sorted_exits}
+            for b in probe_batches:
+                labels = b["labels"].to(dev, non_blocking=True)
+                soft_targets = get_smooth_labels(
+                    labels,
+                    classid_list=num_classes,
+                    smoothing_coeff=smoothing_coeff,
+                ).to(dev)
+                v1 = _move_view(b["view1"], dev)
+                v2 = _move_view(b["view2"], dev)
+                with torch.amp.autocast("cuda", dtype=amp_dt, enabled=use_amp and dev.type == "cuda"):
+                    o1 = model(**v1, compute_projections=True, compute_logits=False)
+                    o2 = model(**v2, compute_projections=True, compute_logits=False)
+                p1_f32 = {l: t.float() for l, t in o1.projections_dict.items()}
+                p2_f32 = {l: t.float() for l, t in o2.projections_dict.items()}
+                l_dict = supcon_criterion((p1_f32, p2_f32), soft_targets)
+                for l in sorted_exits:
+                    acc_losses[l].append(l_dict[l])
+            return {l: torch.stack(acc_losses[l]).mean() for l in sorted_exits}
 
-    landscape = compute_2d_loss_landscape(
-        model=model,
-        eval_losses_fn=_eval_landscape_losses,
-        shallow_key=sorted_exits[0],
-        deep_key=sorted_exits[-1],
-        weights=exit_weights,
-        grid_size=landscape_grid_size,
-        span=landscape_span,
-        seed=seed,
-    )
+        landscape = compute_2d_loss_landscape(
+            model=model,
+            eval_losses_fn=_eval_landscape_losses,
+            shallow_key=sorted_exits[0],
+            deep_key=sorted_exits[-1],
+            weights=exit_weights,
+            grid_size=landscape_grid_size,
+            span=landscape_span,
+            seed=seed,
+        )
+        _save_checkpoint_atomic(
+            {
+                "epoch": epochs,
+                "stage1_done": True,
+                "global_step": global_step,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": {},
+                "scheduler_state_dict": {},
+                "scaler_state_dict": {},
+                "epoch_logs": epoch_logs,
+                "step_logs": prober.history,
+                "landscape": landscape,
+                "elapsed_sec": elapsed_prior + float(time.perf_counter() - t0),
+            },
+            s1_ckpt,
+        )
 
     stage2_logs: List[Dict[str, Any]] = []
     bs2 = batch_size_stage2 if batch_size_stage2 is not None else batch_size
@@ -891,8 +1034,25 @@ def run_exp2_supcon(
         opt2 = torch.optim.AdamW(head_params, lr=lr_stage2, weight_decay=weight_decay_stage2)
         scaler2 = torch.amp.GradScaler("cuda", enabled=use_amp and dev.type == "cuda" and amp_dt == torch.float16)
         sched2 = torch.optim.lr_scheduler.CosineAnnealingLR(opt2, T_max=max(1, epochs_stage2), eta_min=0.0)
+        start_ep2 = 1
+        best_val_acc2 = -1.0
+        if resume and s2_ckpt.exists():
+            ck2 = torch.load(s2_ckpt, map_location=dev, weights_only=False)
+            model.load_state_dict(ck2["model_state_dict"])
+            opt2.load_state_dict(ck2["optimizer_state_dict"])
+            sched2.load_state_dict(ck2["scheduler_state_dict"])
+            if "scaler_state_dict" in ck2 and scaler2.is_enabled():
+                scaler2.load_state_dict(ck2["scaler_state_dict"])
+            start_ep2 = int(ck2.get("epoch", 0)) + 1
+            stage2_logs = list(ck2.get("stage2_logs", []))
+            best_val_acc2 = float(ck2.get("best_val_acc", -1.0))
+            elapsed_prior = max(elapsed_prior, float(ck2.get("elapsed_sec", 0.0)))
+            model.freeze_encoder()
+            model.train()
+            model.backbone.eval()
+            print(f"[Exp2 SupCon Stage2] Resumed from {s2_ckpt} at epoch {start_ep2}/{epochs_stage2}")
 
-        for ep2 in range(1, epochs_stage2 + 1):
+        for ep2 in range(start_ep2, epochs_stage2 + 1):
             opt2.zero_grad(set_to_none=True)
             tot_ce = 0.0
             nb2 = 0
@@ -920,14 +1080,31 @@ def run_exp2_supcon(
                     "val_ece": val_metrics["ece"],
                 }
             )
+            val_l12 = float(val_metrics["accuracy"][str(sorted_exits[-1])])
+            if val_l12 >= best_val_acc2:
+                best_val_acc2 = val_l12
+                _save_checkpoint_atomic(model.state_dict(), out_path / "model_best.pt")
+            _save_checkpoint_atomic(
+                {
+                    "epoch": ep2,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": opt2.state_dict(),
+                    "scheduler_state_dict": sched2.state_dict(),
+                    "scaler_state_dict": scaler2.state_dict(),
+                    "stage2_logs": stage2_logs,
+                    "best_val_acc": best_val_acc2,
+                    "elapsed_sec": elapsed_prior + float(time.perf_counter() - t0),
+                },
+                s2_ckpt,
+            )
             print(
                 f"[Exp2 SupCon Stage2 Probe] Epoch {ep2}/{epochs_stage2} "
                 f"ce={tot_ce / max(1, nb2):.4f} "
                 f"L{sorted_exits[0]}={val_metrics['accuracy'][str(sorted_exits[0])]:.2f}% "
-                f"L{sorted_exits[-1]}={val_metrics['accuracy'][str(sorted_exits[-1])]:.2f}%"
+                f"L{sorted_exits[-1]}={val_l12:.2f}%"
             )
 
-    wall_time = float(time.perf_counter() - t0)
+    wall_time = elapsed_prior + float(time.perf_counter() - t0)
     peak_vram_mb = (
         float(torch.cuda.max_memory_allocated(dev) / (1024.0 ** 2))
         if dev.type == "cuda"
@@ -976,9 +1153,525 @@ def run_exp2_supcon(
         "peak_vram_mb": peak_vram_mb,
     }
 
-    log_file = out_path / "gradient_conflict_log.json"
     log_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    torch.save(model.state_dict(), out_path / "model_final.pt")
+    _save_checkpoint_atomic(model.state_dict(), final_ckpt)
+    del model
+    gc.collect()
+    if dev.type == "cuda":
+        torch.cuda.empty_cache()
+    return payload
+
+
+# Source: Exp 3 Group-wise SupCon-ST (Disjoint Group 1 [0,1,4] & Group 2 [8,10,12] optimization, AIC-Lab Group-wise + SimCLR + ConOSR)
+def run_exp3_groupwise(
+    data_dir: Union[str, Path],
+    output_dir: Union[str, Path],
+    exit_layers: Sequence[int] = (0, 1, 4, 8, 10, 12),
+    num_classes: int = 16,
+    weighting_mode: str = "uniform",
+    gamma: float = 0.5,
+    batch_size: int = 4,
+    grad_accum_steps: int = 4,
+    sampler: str = "pk",
+    pk_p: int = 2,
+    pk_k: int = 2,
+    epochs: int = 30,
+    lr: float = 5e-5,
+    weight_decay: float = 1e-4,
+    exclude_bias_norm: bool = True,
+    warmup_ratio: float = 0.1,
+    warmup_start_lr_ratio: float = 0.1,
+    eta_min_ratio: float = 0.0,
+    temperature: float = 0.1,
+    base_temperature: Optional[float] = None,
+    smoothing_coeff: float = 0.1,
+    use_lars: bool = False,
+    lars_eta: float = 0.02,
+    max_grad_norm: float = 1.0,
+    max_shear: float = 4.0,
+    brightness_range: Tuple[float, float] = (0.8, 1.2),
+    p_blur: float = 0.5,
+    blur_sigma: Tuple[float, float] = (0.1, 2.0),
+    noise_std: float = 8.0,
+    p_erase: float = 0.3,
+    epochs_stage2: int = 20,
+    batch_size_stage2: Optional[int] = None,
+    eval_batch_size: int = 1,
+    grad_accum_steps_stage2: int = 1,
+    lr_stage2: float = 3e-4,
+    weight_decay_stage2: float = 0.0,
+    label_smoothing_stage2: float = 0.1,
+    use_aug_stage2: bool = True,
+    probe_every_n_steps: int = 10,
+    landscape_grid_size: int = 11,
+    landscape_span: float = 0.5,
+    max_samples: Optional[int] = None,
+    num_workers: int = 0,
+    seed: int = 42,
+    device: str = "cuda",
+    use_amp: bool = True,
+    use_checkpointing: bool = True,
+    dry_run: bool = False,
+    run_stage2_probe: bool = True,
+    resume: bool = True,
+) -> Dict[str, Any]:
+    set_seed(seed)
+    dev = _resolve_device(device)
+    amp_dt = _amp_dtype(dev)
+    out_path = Path(output_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    log_file = out_path / "gradient_conflict_log.json"
+    final_ckpt = out_path / "model_final.pt"
+    s1_ckpt = out_path / "checkpoint_stage1_last.pt"
+    s2_ckpt = out_path / "checkpoint_stage2_last.pt"
+    if resume and log_file.exists() and final_ckpt.exists():
+        print(f"[Exp3 Groupwise] Already completed at {out_path}, loading saved log.")
+        return json.loads(log_file.read_text(encoding="utf-8"))
+
+    sorted_exits = sorted({int(l) for l in exit_layers})
+    if not sorted_exits or any(l < 0 or l > 12 for l in sorted_exits):
+        raise ValueError(f"exit_layers must be integers in [0, 12], got {exit_layers}")
+
+    g1_exits = tuple(l for l in sorted_exits if l <= 4)
+    g2_exits = tuple(l for l in sorted_exits if l > 4)
+    groups = {"group1": g1_exits, "group2": g2_exits}
+    model = DIC(
+        num_classes=num_classes,
+        exit_layers=sorted_exits,
+        groups=groups,
+        projection_dim=128,
+    ).to(dev)
+
+    if use_checkpointing:
+        enable_layoutlmv3_checkpointing(model)
+
+    exit_weights = compute_exit_weights(
+        model=model,
+        exit_layers=sorted_exits,
+        weighting_mode=weighting_mode,
+        gamma=gamma,
+    )
+    probe_layers = tuple(sorted_exits[:-1])
+    probe_groups = extract_shared_layer_param_groups(model, probe_layers=probe_layers)
+    prober = GradientConflictProber(probe_param_groups=probe_groups)
+
+    resolved_base_temp = temperature if base_temperature is None else base_temperature
+    supcon_criterion = MultiExitSupConLoss(
+        exit_layers=sorted_exits,
+        temperature=temperature,
+        base_temperature=resolved_base_temp,
+    ).to(dev)
+    ce_criterion = MultiExitCELoss(
+        exit_layers=sorted_exits,
+        label_smoothing=label_smoothing_stage2,
+    ).to(dev)
+
+    aug_tf = get_transforms(
+        max_shear=max_shear,
+        brightness_range=brightness_range,
+        p_erase=p_erase,
+        noise_std=noise_std,
+        p_blur=p_blur,
+        blur_sigma=blur_sigma,
+    )
+    train_loader_s1, val_loader_s1 = _build_loaders(
+        data_dir=data_dir,
+        batch_size=batch_size,
+        eval_batch_size=batch_size,
+        num_workers=num_workers,
+        is_contrastive=True,
+        max_samples=max_samples,
+        dry_run=dry_run,
+        num_classes=num_classes,
+        seed=seed,
+        sampler_type=sampler,
+        pk_p=pk_p,
+        pk_k=pk_k,
+        transform=aug_tf,
+    )
+
+    g1_named, g2_named = _split_groupwise_named_params(model, split_layer=4)
+    g1_params = [p for _, p in g1_named]
+    g2_params = [p for _, p in g2_named]
+    g1_groups = build_adamw_param_groups(g1_named, weight_decay=weight_decay, exclude_bias_norm=exclude_bias_norm)
+    g2_groups = build_adamw_param_groups(g2_named, weight_decay=weight_decay, exclude_bias_norm=exclude_bias_norm)
+    base_opt_g1 = torch.optim.AdamW(g1_groups, lr=lr) if g1_groups else None
+    base_opt_g2 = torch.optim.AdamW(g2_groups, lr=lr) if g2_groups else None
+    opt_g1 = LARSWrapper(base_opt_g1, eta=lars_eta, clip=True) if (use_lars and base_opt_g1 is not None) else base_opt_g1
+    opt_g2 = LARSWrapper(base_opt_g2, eta=lars_eta, clip=True) if (use_lars and base_opt_g2 is not None) else base_opt_g2
+    scaler_g1 = torch.amp.GradScaler("cuda", enabled=use_amp and dev.type == "cuda" and amp_dt == torch.float16)
+    scaler_g2 = torch.amp.GradScaler("cuda", enabled=use_amp and dev.type == "cuda" and amp_dt == torch.float16)
+    steps_per_epoch = max(1, math.ceil(len(train_loader_s1) / max(1, grad_accum_steps)))
+    sched_g1 = (
+        _build_cosine_warmup_scheduler(
+            base_opt_g1,
+            total_steps=steps_per_epoch * epochs,
+            warmup_ratio=warmup_ratio,
+            warmup_start_lr_ratio=warmup_start_lr_ratio,
+            eta_min_ratio=eta_min_ratio,
+        )
+        if base_opt_g1 is not None
+        else None
+    )
+    sched_g2 = (
+        _build_cosine_warmup_scheduler(
+            base_opt_g2,
+            total_steps=steps_per_epoch * epochs,
+            warmup_ratio=warmup_ratio,
+            warmup_start_lr_ratio=warmup_start_lr_ratio,
+            eta_min_ratio=eta_min_ratio,
+        )
+        if base_opt_g2 is not None
+        else None
+    )
+
+    if dev.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(dev)
+
+    t0 = time.perf_counter()
+    epoch_logs: List[Dict[str, Any]] = []
+    global_step = 0
+    start_epoch = 1
+    landscape: Optional[Dict[str, Any]] = None
+    elapsed_prior = 0.0
+    if resume and s1_ckpt.exists():
+        ck1 = torch.load(s1_ckpt, map_location=dev, weights_only=False)
+        model.load_state_dict(ck1["model_state_dict"])
+        if base_opt_g1 is not None and ck1.get("opt_g1_state_dict"):
+            base_opt_g1.load_state_dict(ck1["opt_g1_state_dict"])
+        if base_opt_g2 is not None and ck1.get("opt_g2_state_dict"):
+            base_opt_g2.load_state_dict(ck1["opt_g2_state_dict"])
+        if sched_g1 is not None and ck1.get("sched_g1_state_dict"):
+            sched_g1.load_state_dict(ck1["sched_g1_state_dict"])
+        if sched_g2 is not None and ck1.get("sched_g2_state_dict"):
+            sched_g2.load_state_dict(ck1["sched_g2_state_dict"])
+        start_epoch = int(ck1.get("epoch", 0)) + 1
+        global_step = int(ck1.get("global_step", 0))
+        epoch_logs = list(ck1.get("epoch_logs", []))
+        prober.history = list(ck1.get("step_logs", []))
+        landscape = ck1.get("landscape")
+        elapsed_prior = float(ck1.get("elapsed_sec", 0.0))
+        print(f"[Exp3 Groupwise Stage1] Resumed from {s1_ckpt} at epoch {start_epoch}/{epochs}")
+
+    model.unfreeze_encoder()
+    model.train()
+
+    for epoch in range(start_epoch, epochs + 1):
+        if opt_g1 is not None:
+            opt_g1.zero_grad(set_to_none=True)
+        if opt_g2 is not None:
+            opt_g2.zero_grad(set_to_none=True)
+        running_total = 0.0
+        running_per_exit = {l: 0.0 for l in sorted_exits}
+        n_batches = 0
+
+        for step_idx, batch in enumerate(train_loader_s1, start=1):
+            global_step += 1
+            n_batches += 1
+            labels = batch["labels"].to(dev, non_blocking=True)
+            soft_targets = get_smooth_labels(labels, classid_list=num_classes, smoothing_coeff=smoothing_coeff).to(dev)
+            v1 = _move_view(batch["view1"], dev)
+            v2 = _move_view(batch["view2"], dev)
+
+            if global_step == 1 or (probe_every_n_steps > 0 and global_step % probe_every_n_steps == 0):
+                for p in g1_params:
+                    p.requires_grad = True
+                for p in g2_params:
+                    p.requires_grad = True
+                with torch.amp.autocast("cuda", dtype=amp_dt, enabled=use_amp and dev.type == "cuda"):
+                    po1 = model(**v1, compute_projections=True, compute_logits=False)
+                    po2 = model(**v2, compute_projections=True, compute_logits=False)
+                p1_f32 = {l: t.float() for l, t in po1.projections_dict.items()}
+                p2_f32 = {l: t.float() for l, t in po2.projections_dict.items()}
+                probe_losses = supcon_criterion((p1_f32, p2_f32), soft_targets)
+                prober.probe(step=global_step, exit_losses=probe_losses, weights=exit_weights)
+                del po1, po2, probe_losses
+
+            step_loss_sum = 0.0
+            if g1_exits and opt_g1 is not None:
+                for p in g1_params:
+                    p.requires_grad = True
+                for p in g2_params:
+                    p.requires_grad = False
+                with torch.amp.autocast("cuda", dtype=amp_dt, enabled=use_amp and dev.type == "cuda"):
+                    o1 = model.forward_group("group1", **v1, compute_projections=True, compute_logits=False)
+                    o2 = model.forward_group("group1", **v2, compute_projections=True, compute_logits=False)
+                g1_loss = torch.zeros((), device=dev, dtype=torch.float32)
+                for l in g1_exits:
+                    lv = supcon_criterion.supcon(
+                        torch.stack([o1.projections_dict[l].float(), o2.projections_dict[l].float()], dim=1),
+                        soft_targets,
+                    )
+                    running_per_exit[l] += float(lv.detach().item())
+                    g1_loss = g1_loss + exit_weights[l] * lv
+                scaler_g1.scale(g1_loss / float(max(1, grad_accum_steps))).backward()
+                step_loss_sum += float(g1_loss.detach().item())
+
+            if g2_exits and opt_g2 is not None:
+                for p in g1_params:
+                    p.requires_grad = False
+                for p in g2_params:
+                    p.requires_grad = True
+                with torch.amp.autocast("cuda", dtype=amp_dt, enabled=use_amp and dev.type == "cuda"):
+                    o1 = model.forward_group("group2", **v1, compute_projections=True, compute_logits=False)
+                    o2 = model.forward_group("group2", **v2, compute_projections=True, compute_logits=False)
+                g2_loss = torch.zeros((), device=dev, dtype=torch.float32)
+                for l in g2_exits:
+                    lv = supcon_criterion.supcon(
+                        torch.stack([o1.projections_dict[l].float(), o2.projections_dict[l].float()], dim=1),
+                        soft_targets,
+                    )
+                    running_per_exit[l] += float(lv.detach().item())
+                    g2_loss = g2_loss + exit_weights[l] * lv
+                scaler_g2.scale(g2_loss / float(max(1, grad_accum_steps))).backward()
+                step_loss_sum += float(g2_loss.detach().item())
+
+            running_total += step_loss_sum
+
+            if step_idx % max(1, grad_accum_steps) == 0 or step_idx == len(train_loader_s1):
+                if opt_g1 is not None and g1_exits:
+                    scaler_g1.unscale_(opt_g1)
+                    if max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(g1_params, max_grad_norm)
+                    scaler_g1.step(opt_g1)
+                    scaler_g1.update()
+                    if sched_g1 is not None:
+                        sched_g1.step()
+                    opt_g1.zero_grad(set_to_none=True)
+                if opt_g2 is not None and g2_exits:
+                    scaler_g2.unscale_(opt_g2)
+                    if max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(g2_params, max_grad_norm)
+                    scaler_g2.step(opt_g2)
+                    scaler_g2.update()
+                    if sched_g2 is not None:
+                        sched_g2.step()
+                    opt_g2.zero_grad(set_to_none=True)
+
+        epoch_rec = {
+            "epoch": epoch,
+            "train_total_loss": running_total / max(1, n_batches),
+            "train_exit_losses": {str(l): running_per_exit[l] / max(1, n_batches) for l in sorted_exits},
+            "lr": float(sched_g1.get_last_lr()[0]) if sched_g1 is not None else lr,
+        }
+        epoch_logs.append(epoch_rec)
+        _save_checkpoint_atomic(
+            {
+                "epoch": epoch,
+                "stage1_done": False,
+                "global_step": global_step,
+                "model_state_dict": model.state_dict(),
+                "opt_g1_state_dict": base_opt_g1.state_dict() if base_opt_g1 is not None else {},
+                "opt_g2_state_dict": base_opt_g2.state_dict() if base_opt_g2 is not None else {},
+                "sched_g1_state_dict": sched_g1.state_dict() if sched_g1 is not None else {},
+                "sched_g2_state_dict": sched_g2.state_dict() if sched_g2 is not None else {},
+                "epoch_logs": epoch_logs,
+                "step_logs": prober.history,
+                "landscape": None,
+                "elapsed_sec": elapsed_prior + float(time.perf_counter() - t0),
+            },
+            s1_ckpt,
+        )
+        print(f"[Exp3 Groupwise Stage1] Epoch {epoch}/{epochs} loss={epoch_rec['train_total_loss']:.4f}")
+
+    for p in g1_params:
+        p.requires_grad = True
+    for p in g2_params:
+        p.requires_grad = True
+    del opt_g1, opt_g2, base_opt_g1, base_opt_g2, sched_g1, sched_g2, scaler_g1, scaler_g2
+    gc.collect()
+    if dev.type == "cuda":
+        torch.cuda.empty_cache()
+
+    if landscape is None:
+        probe_batches = list(itertools.islice(val_loader_s1, 2))
+
+        def _eval_landscape_losses() -> Dict[int, torch.Tensor]:
+            acc_losses: Dict[int, List[torch.Tensor]] = {l: [] for l in sorted_exits}
+            for b in probe_batches:
+                labels = b["labels"].to(dev, non_blocking=True)
+                soft_targets = get_smooth_labels(labels, classid_list=num_classes, smoothing_coeff=smoothing_coeff).to(dev)
+                v1 = _move_view(b["view1"], dev)
+                v2 = _move_view(b["view2"], dev)
+                with torch.amp.autocast("cuda", dtype=amp_dt, enabled=use_amp and dev.type == "cuda"):
+                    o1 = model(**v1, compute_projections=True, compute_logits=False)
+                    o2 = model(**v2, compute_projections=True, compute_logits=False)
+                p1_f32 = {l: t.float() for l, t in o1.projections_dict.items()}
+                p2_f32 = {l: t.float() for l, t in o2.projections_dict.items()}
+                l_dict = supcon_criterion((p1_f32, p2_f32), soft_targets)
+                for l in sorted_exits:
+                    acc_losses[l].append(l_dict[l])
+            return {l: torch.stack(acc_losses[l]).mean() for l in sorted_exits}
+
+        landscape = compute_2d_loss_landscape(
+            model=model,
+            eval_losses_fn=_eval_landscape_losses,
+            shallow_key=sorted_exits[0],
+            deep_key=sorted_exits[-1],
+            weights=exit_weights,
+            grid_size=landscape_grid_size,
+            span=landscape_span,
+            seed=seed,
+        )
+        _save_checkpoint_atomic(
+            {
+                "epoch": epochs,
+                "stage1_done": True,
+                "global_step": global_step,
+                "model_state_dict": model.state_dict(),
+                "epoch_logs": epoch_logs,
+                "step_logs": prober.history,
+                "landscape": landscape,
+                "elapsed_sec": elapsed_prior + float(time.perf_counter() - t0),
+            },
+            s1_ckpt,
+        )
+
+    stage2_logs: List[Dict[str, Any]] = []
+    bs2 = batch_size_stage2 if batch_size_stage2 is not None else batch_size
+    if run_stage2_probe and epochs_stage2 > 0:
+        train_loader_s2, val_loader_s2 = _build_loaders(
+            data_dir=data_dir,
+            batch_size=bs2,
+            eval_batch_size=eval_batch_size,
+            num_workers=num_workers,
+            is_contrastive=False,
+            max_samples=max_samples,
+            dry_run=dry_run,
+            num_classes=num_classes,
+            seed=seed,
+            transform=aug_tf if use_aug_stage2 else None,
+        )
+        model.freeze_encoder()
+        model.train()
+        model.backbone.eval()
+
+        head_params = list(model.exit_heads.parameters())
+        opt2 = torch.optim.AdamW(head_params, lr=lr_stage2, weight_decay=weight_decay_stage2)
+        scaler2 = torch.amp.GradScaler("cuda", enabled=use_amp and dev.type == "cuda" and amp_dt == torch.float16)
+        sched2 = torch.optim.lr_scheduler.CosineAnnealingLR(opt2, T_max=max(1, epochs_stage2), eta_min=0.0)
+        start_ep2 = 1
+        best_val_acc2 = -1.0
+        if resume and s2_ckpt.exists():
+            ck2 = torch.load(s2_ckpt, map_location=dev, weights_only=False)
+            model.load_state_dict(ck2["model_state_dict"])
+            opt2.load_state_dict(ck2["optimizer_state_dict"])
+            sched2.load_state_dict(ck2["scheduler_state_dict"])
+            if "scaler_state_dict" in ck2 and scaler2.is_enabled():
+                scaler2.load_state_dict(ck2["scaler_state_dict"])
+            start_ep2 = int(ck2.get("epoch", 0)) + 1
+            stage2_logs = list(ck2.get("stage2_logs", []))
+            best_val_acc2 = float(ck2.get("best_val_acc", -1.0))
+            elapsed_prior = max(elapsed_prior, float(ck2.get("elapsed_sec", 0.0)))
+            model.freeze_encoder()
+            model.train()
+            model.backbone.eval()
+            print(f"[Exp3 Groupwise Stage2] Resumed from {s2_ckpt} at epoch {start_ep2}/{epochs_stage2}")
+
+        for ep2 in range(start_ep2, epochs_stage2 + 1):
+            opt2.zero_grad(set_to_none=True)
+            tot_ce = 0.0
+            nb2 = 0
+            for st2, batch in enumerate(train_loader_s2, start=1):
+                nb2 += 1
+                labels = batch["labels"].to(dev, non_blocking=True)
+                inputs = _move_view(batch, dev)
+                with torch.amp.autocast("cuda", dtype=amp_dt, enabled=use_amp and dev.type == "cuda"):
+                    out = model(**inputs, compute_projections=False, compute_logits=True)
+                    ce_dict = ce_criterion(out.logits_dict, labels)
+                    ce_loss = ce_criterion.compute_total_loss(ce_dict)
+                scaler2.scale(ce_loss / float(max(1, grad_accum_steps_stage2))).backward()
+                tot_ce += float(ce_loss.detach().float().item())
+                if st2 % max(1, grad_accum_steps_stage2) == 0 or st2 == len(train_loader_s2):
+                    scaler2.step(opt2)
+                    scaler2.update()
+                    opt2.zero_grad(set_to_none=True)
+            sched2.step()
+            val_metrics = _evaluate_dic_model(model, val_loader_s2, sorted_exits, dev, use_amp, amp_dt)
+            stage2_logs.append(
+                {
+                    "epoch": ep2,
+                    "train_ce_loss": tot_ce / max(1, nb2),
+                    "val_accuracy": val_metrics["accuracy"],
+                    "val_ece": val_metrics["ece"],
+                }
+            )
+            val_l12 = float(val_metrics["accuracy"][str(sorted_exits[-1])])
+            if val_l12 >= best_val_acc2:
+                best_val_acc2 = val_l12
+                _save_checkpoint_atomic(model.state_dict(), out_path / "model_best.pt")
+            _save_checkpoint_atomic(
+                {
+                    "epoch": ep2,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": opt2.state_dict(),
+                    "scheduler_state_dict": sched2.state_dict(),
+                    "scaler_state_dict": scaler2.state_dict(),
+                    "stage2_logs": stage2_logs,
+                    "best_val_acc": best_val_acc2,
+                    "elapsed_sec": elapsed_prior + float(time.perf_counter() - t0),
+                },
+                s2_ckpt,
+            )
+            print(
+                f"[Exp3 Groupwise Stage2 Probe] Epoch {ep2}/{epochs_stage2} "
+                f"ce={tot_ce / max(1, nb2):.4f} "
+                f"L{sorted_exits[0]}={val_metrics['accuracy'][str(sorted_exits[0])]:.2f}% "
+                f"L{sorted_exits[-1]}={val_l12:.2f}%"
+            )
+
+    wall_time = elapsed_prior + float(time.perf_counter() - t0)
+    peak_vram_mb = (
+        float(torch.cuda.max_memory_allocated(dev) / (1024.0 ** 2))
+        if dev.type == "cuda"
+        else 0.0
+    )
+
+    payload: Dict[str, Any] = {
+        "experiment": "exp3_groupwise",
+        "config": {
+            "exit_layers": sorted_exits,
+            "groups": {k: list(v) for k, v in groups.items()},
+            "weighting_mode": weighting_mode,
+            "exit_weights": {str(k): v for k, v in exit_weights.items()},
+            "gamma": gamma,
+            "batch_size": batch_size,
+            "grad_accum_steps": grad_accum_steps,
+            "sampler": sampler,
+            "pk_p": pk_p,
+            "pk_k": pk_k,
+            "epochs": epochs,
+            "lr": lr,
+            "weight_decay": weight_decay,
+            "exclude_bias_norm": exclude_bias_norm,
+            "warmup_ratio": warmup_ratio,
+            "temperature": temperature,
+            "base_temperature": resolved_base_temp,
+            "smoothing_coeff": smoothing_coeff,
+            "use_lars": use_lars,
+            "lars_eta": lars_eta,
+            "epochs_stage2": epochs_stage2,
+            "batch_size_stage2": bs2,
+            "eval_batch_size": eval_batch_size,
+            "grad_accum_steps_stage2": grad_accum_steps_stage2,
+            "lr_stage2": lr_stage2,
+            "weight_decay_stage2": weight_decay_stage2,
+            "label_smoothing_stage2": label_smoothing_stage2,
+            "use_aug_stage2": use_aug_stage2,
+            "seed": seed,
+            "dry_run": dry_run,
+        },
+        "epoch_logs": epoch_logs,
+        "stage2_logs": stage2_logs,
+        "step_logs": prober.history,
+        "summary": prober.summarize(),
+        "loss_landscape": landscape,
+        "runtime_sec": wall_time,
+        "peak_vram_mb": peak_vram_mb,
+    }
+
+    log_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    _save_checkpoint_atomic(model.state_dict(), final_ckpt)
     del model
     gc.collect()
     if dev.type == "cuda":

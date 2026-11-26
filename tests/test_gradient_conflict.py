@@ -643,6 +643,306 @@ def test_exit_weights_supcon_scale_lars_exclusion_and_pk_sampler() -> None:
     assert out_img.shape == img.shape and out_img.dtype == img.dtype
 
 
+def test_metrics_calibration_heuristic_and_true_early_exit(tmp_path: Path) -> None:
+    from model.DIC import DIC
+    from model.modules.ee_modules import EarlyExitPolicy, ExitConfig
+    from model.modules.layoutlmv3 import LayoutLMv3EEForSequenceClassification
+    from train_test.evaluate import (
+        EarlyExitEvaluator,
+        build_cached_eval_loader,
+        load_model_for_evaluation,
+    )
+    from utils.metrics import (
+        compute_classification_metrics,
+        compute_efficiency_metrics,
+        compute_subgraph_param_ratios,
+        extract_pareto_frontier,
+    )
+
+    logits_np = torch.tensor([[5.0, 0.0, 0.0], [0.0, 4.0, 0.0], [0.0, 0.0, 3.0], [2.0, 1.0, 0.0]])
+    labels_np = torch.tensor([0, 1, 2, 1])
+    m = compute_classification_metrics(labels_np, logits_np)
+    assert math.isclose(m["accuracy"], 75.0, rel_tol=1e-6)
+    assert 0.0 <= m["ece"] <= 1.0
+    assert m["nll"] > 0.0 and m["brier"] > 0.0
+    assert 0.0 <= m["aurc"] <= 1.0
+
+    tau_arr = EarlyExitPolicy.compute_heuristic_thresholds(
+        accuracies=[0.5, 0.6, 0.7, 0.75, 0.78, 0.99],
+        eces=[0.2, 0.15, 0.12, 0.1, 0.08, 0.001],
+        epsilon=0.1,
+        exclude_final=True,
+    )
+    assert len(tau_arr) == 6
+    assert tau_arr[-1] == 0.0
+    assert all(0.0 < float(x) < 1.0 for x in tau_arr[:-1])
+
+    pts = [
+        {"params_reduction": 10.0, "adaptive_accuracy": 80.0},
+        {"params_reduction": 20.0, "adaptive_accuracy": 79.0},
+        {"params_reduction": 20.0, "adaptive_accuracy": 82.0},
+        {"params_reduction": 40.0, "adaptive_accuracy": 75.0},
+    ]
+    frontier = extract_pareto_frontier(pts, x_key="params_reduction", y_key="adaptive_accuracy")
+    assert [(p["params_reduction"], p["adaptive_accuracy"]) for p in frontier] == [(20.0, 82.0), (40.0, 75.0)]
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    exits = (0, 1, 4, 8, 10, 12)
+    dic_model = DICWithoutGroupwise(num_classes=16, exit_layers=exits).to(device)
+    dic_model.eval()
+    ratios = compute_subgraph_param_ratios(dic_model, exits)
+    assert 0.1 < ratios[0] < ratios[1] < ratios[4] < ratios[8] < ratios[10] < ratios[12] == 1.0
+
+    eff_l0 = compute_efficiency_metrics({0: 100.0, 1: 0.0, 4: 0.0, 8: 0.0, 10: 0.0, 12: 0.0}, exits, ratios)
+    assert 0.0 < eff_l0["params_reduction"] < 90.0
+
+    inp = {
+        "input_ids": torch.randint(0, 1000, (1, 16), dtype=torch.long, device=device),
+        "bbox": torch.zeros((1, 16, 4), dtype=torch.long, device=device),
+        "pixel_values": torch.randn(1, 3, 224, 224, device=device),
+        "attention_mask": torch.ones((1, 16), dtype=torch.long, device=device),
+    }
+    with torch.no_grad():
+        full_out = dic_model(**inp, compute_projections=False, compute_logits=True)
+        lg_0, ex_0 = dic_model.forward_early_exit(**inp, threshold=0.0)
+        assert ex_0 == 0
+        assert torch.allclose(lg_0, full_out.logits_dict[0], atol=1e-4)
+
+        lg_4, ex_4 = dic_model.forward_early_exit(
+            **inp,
+            exit_thresholds={0: 2.0, 1: 2.0, 4: 0.0, 8: 2.0, 10: 2.0, 12: 0.0},
+        )
+        assert ex_4 == 4
+        assert torch.allclose(lg_4, full_out.logits_dict[4], atol=1e-4)
+
+        lg_12, ex_12 = dic_model.forward_early_exit(**inp, threshold=2.0)
+        assert ex_12 == 12
+        assert torch.allclose(lg_12, full_out.logits_dict[12], atol=1e-4)
+
+    dic_gw = DIC(num_classes=16, exit_layers=exits).to(device)
+    dic_gw.eval()
+    with torch.no_grad():
+        gw_full = dic_gw(**inp, compute_projections=False, compute_logits=True)
+        gw_lg, gw_ex = dic_gw.forward_early_exit(**inp, threshold=0.0)
+        assert gw_ex == 0
+        assert torch.allclose(gw_lg, gw_full.logits_dict[0], atol=1e-4)
+
+    evaluator_dic = EarlyExitEvaluator(model=dic_model, exit_layers=exits, device=device)
+    with pytest.raises(KeyError):
+        evaluator_dic.collect_all_logits([{"pixel_values": torch.randn(2, 3, 224, 224), "labels": torch.tensor([0, 1])}])
+
+    dummy_loader = [
+        {
+            "pixel_values": torch.randn(4, 3, 224, 224),
+            "input_ids": torch.randint(0, 1000, (4, 16), dtype=torch.long),
+            "bbox": torch.zeros((4, 16, 4), dtype=torch.long),
+            "attention_mask": torch.ones((4, 16), dtype=torch.long),
+            "labels": torch.tensor([0, 1, 2, 3]),
+        }
+        for _ in range(2)
+    ]
+    eval_dir = tmp_path / "eval_dic"
+    report_dic = evaluator_dic.run_full_evaluation(
+        test_loader=dummy_loader,
+        val_loader=dummy_loader,
+        criterion="max_confidence",
+        threshold=0.5,
+        epsilon=0.1,
+        calibrate=True,
+        output_dir=eval_dir,
+        benchmark_latency=True,
+        latency_max_samples=4,
+    )
+    assert "calibrated" in report_dic
+    assert "heuristic" in report_dic["calibrated"]
+    assert "latency_benchmark" in report_dic
+    assert (eval_dir / "evaluation_report.json").exists()
+    assert (eval_dir / "fig_pareto_tradeoff.png").exists()
+    assert (eval_dir / "fig_pareto_tradeoff.pdf").exists()
+
+    ee_cfg = ExitConfig(
+        training_strategy="one_stage_subgraphs_weighted",
+        inference_strategy="max_confidence",
+        exits=["text_visual_concat", 1, 4, 8, 10],
+        encoder_layer_strategy="ramp",
+        exit_head_num_layers=2,
+    )
+    ee_model = LayoutLMv3EEForSequenceClassification.from_local_checkpoint(num_labels=16, ee_config=ee_cfg).to(device)
+    ee_ckpt = tmp_path / "ee_final.pt"
+    torch.save(ee_model.state_dict(), ee_ckpt)
+    loaded_ee, resolved_type = load_model_for_evaluation("auto", ee_ckpt, num_classes=16, exit_layers=exits, device=device)
+    assert resolved_type == "ee_hamed"
+    evaluator_ee = EarlyExitEvaluator(model=loaded_ee, exit_layers=exits, device=device)
+    report_ee = evaluator_ee.run_full_evaluation(
+        test_loader=dummy_loader,
+        val_loader=dummy_loader,
+        calibrate=True,
+        benchmark_latency=True,
+        latency_max_samples=4,
+    )
+    assert len(report_ee["uncalibrated"]["static"]) == 6
+    assert len(report_ee["calibrated"]["global_sweep"]) == 21
+    assert report_ee["latency_benchmark"]["num_samples"] == 4
+
+    cache_dir = tmp_path / "cached_ocr_ds"
+    (cache_dir / "images" / "test").mkdir(parents=True)
+    (cache_dir / "ocr_cache").mkdir(parents=True)
+    Image.new("RGB", (64, 64), color=(250, 250, 250)).save(cache_dir / "images" / "test" / "0.png")
+    (cache_dir / "ocr_cache" / "test.jsonl").write_text(
+        json.dumps({"id": 0, "image_path": "images/test/0.png", "label": 0, "words": ["hello"], "boxes": [[10, 10, 50, 30]]}) + "\n",
+        encoding="utf-8",
+    )
+    cached_loader = build_cached_eval_loader(cache_dir, split="test", batch_size=1)
+    first_batch = next(iter(cached_loader))
+    assert "input_ids" in first_batch and "bbox" in first_batch and first_batch["input_ids"].shape[1] > 1
+
+
+def test_checkpoint_resume_exp3_groupwise_and_run_all(tmp_path: Path) -> None:
+    import main as root_main
+    from train_test.exp_runner import run_exp1_hamed_ce, run_exp3_groupwise
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    e1_dir = tmp_path / "resume_e1"
+    run_exp1_hamed_ce(
+        data_dir=tmp_path,
+        output_dir=e1_dir,
+        exit_layers=(0, 4, 12),
+        batch_size=2,
+        grad_accum_steps=1,
+        epochs=1,
+        probe_every_n_steps=1,
+        landscape_grid_size=3,
+        max_samples=4,
+        device=device,
+        dry_run=True,
+        resume=True,
+    )
+    assert (e1_dir / "checkpoint_last.pt").exists()
+    (e1_dir / "gradient_conflict_log.json").unlink()
+    (e1_dir / "model_final.pt").unlink()
+
+    p1_resumed = run_exp1_hamed_ce(
+        data_dir=tmp_path,
+        output_dir=e1_dir,
+        exit_layers=(0, 4, 12),
+        batch_size=2,
+        grad_accum_steps=1,
+        epochs=2,
+        probe_every_n_steps=1,
+        landscape_grid_size=3,
+        max_samples=4,
+        device=device,
+        dry_run=True,
+        resume=True,
+    )
+    assert [e["epoch"] for e in p1_resumed["epoch_logs"]] == [1, 2]
+    p1_cached = run_exp1_hamed_ce(
+        data_dir=tmp_path,
+        output_dir=e1_dir,
+        exit_layers=(0, 4, 12),
+        batch_size=2,
+        grad_accum_steps=1,
+        epochs=2,
+        probe_every_n_steps=1,
+        landscape_grid_size=3,
+        max_samples=4,
+        device=device,
+        dry_run=True,
+        resume=True,
+    )
+    assert p1_cached["runtime_sec"] == p1_resumed["runtime_sec"]
+
+    e3_dir = tmp_path / "resume_e3"
+    run_exp3_groupwise(
+        data_dir=tmp_path,
+        output_dir=e3_dir,
+        exit_layers=(0, 1, 4, 8, 10, 12),
+        batch_size=2,
+        grad_accum_steps=1,
+        epochs=1,
+        epochs_stage2=1,
+        probe_every_n_steps=1,
+        landscape_grid_size=3,
+        max_samples=4,
+        device=device,
+        dry_run=True,
+        resume=True,
+    )
+    assert (e3_dir / "checkpoint_stage1_last.pt").exists()
+    assert (e3_dir / "checkpoint_stage2_last.pt").exists()
+    (e3_dir / "gradient_conflict_log.json").unlink()
+    (e3_dir / "model_final.pt").unlink()
+    (e3_dir / "checkpoint_stage2_last.pt").unlink()
+
+    p3_resumed = run_exp3_groupwise(
+        data_dir=tmp_path,
+        output_dir=e3_dir,
+        exit_layers=(0, 1, 4, 8, 10, 12),
+        batch_size=2,
+        grad_accum_steps=1,
+        epochs=2,
+        epochs_stage2=1,
+        probe_every_n_steps=1,
+        landscape_grid_size=3,
+        max_samples=4,
+        device=device,
+        dry_run=True,
+        resume=True,
+    )
+    assert p3_resumed["experiment"] == "exp3_groupwise"
+    assert p3_resumed["config"]["groups"] == {"group1": [0, 1, 4], "group2": [8, 10, 12]}
+    assert [e["epoch"] for e in p3_resumed["epoch_logs"]] == [1, 2]
+    assert len(p3_resumed["stage2_logs"]) == 1
+
+    all_out = tmp_path / "all_run"
+    parser = root_main.build_parser()
+    args_all = parser.parse_args(
+        [
+            "--mode",
+            "run_all",
+            "--output_dir",
+            str(all_out),
+            "--exit_layers",
+            "0",
+            "4",
+            "12",
+            "--ee_epochs",
+            "1",
+            "--ee_batch_size",
+            "2",
+            "--ee_grad_accum_steps",
+            "1",
+            "--s1_epochs",
+            "1",
+            "--s1_batch_size",
+            "2",
+            "--s1_grad_accum_steps",
+            "1",
+            "--s2_epochs",
+            "1",
+            "--s2_batch_size",
+            "2",
+            "--probe_every_n_steps",
+            "1",
+            "--landscape_grid_size",
+            "3",
+            "--max_samples",
+            "4",
+            "--device",
+            device,
+            "--dry_run",
+            "--no-sweep",
+        ]
+    )
+    root_main.main_app(args_all)
+    summary_file = all_out / "eval" / "all_models_summary.json"
+    assert summary_file.exists()
+    summary = json.loads(summary_file.read_text(encoding="utf-8"))
+    assert set(summary.keys()) == {"exp1_hamed_ce", "exp2_supcon", "exp3_groupwise"}
+    assert (all_out / "figures" / "fig1_cosine_similarity_heatmaps.png").exists()
+
+
 def test_no_comments_or_docstrings_in_new_files() -> None:
     repo_root = Path(__file__).resolve().parent.parent
     new_files = [

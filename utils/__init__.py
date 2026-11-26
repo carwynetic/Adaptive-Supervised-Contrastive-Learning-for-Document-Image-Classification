@@ -30,6 +30,18 @@ from utils.config import (
     build_adamw_param_groups,
 )
 from utils.lars_wrapper import LARSWrapper
+from utils.metrics import (
+    compute_accuracy,
+    compute_aurc,
+    compute_brier_score,
+    compute_classification_metrics,
+    compute_efficiency_metrics,
+    compute_f1_macro,
+    compute_f1_micro,
+    compute_nll,
+    compute_subgraph_param_ratios,
+    extract_pareto_frontier,
+)
 from utils.schedulers import LinearWarmupCosineAnnealingLR
 
 __all__ = [
@@ -43,6 +55,16 @@ __all__ = [
     "build_dataloader",
     "build_dataset",
     "build_model_from_checkpoint",
+    "compute_accuracy",
+    "compute_aurc",
+    "compute_brier_score",
+    "compute_classification_metrics",
+    "compute_efficiency_metrics",
+    "compute_f1_macro",
+    "compute_f1_micro",
+    "compute_nll",
+    "compute_subgraph_param_ratios",
+    "extract_pareto_frontier",
     "extract_model_metadata",
     "get_dataloaders",
     "is_hf_pretrained_model",

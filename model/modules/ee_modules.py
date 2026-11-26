@@ -711,20 +711,35 @@ class EarlyExitPolicy:
         accuracies: Sequence[float],
         eces: Sequence[float],
         epsilon: float = 0.1,
+        exclude_final: bool = True,
     ) -> np.ndarray:
         """
         Tính ngưỡng thoát sớm động cho từng tầng theo Công thức (10) và (12):
-            T_b = 1 - (ACC_b / ECE_b)
+            T_b = 1 - (ACC_b / ECE_b), b in [1, B - 1]
             \\tau_{normalized} = (T - (min(T) - \\epsilon)) / ((max(T) + \\epsilon) - (min(T) - \\epsilon))
         """
+        n_total = len(accuracies)
+        if n_total == 0:
+            return np.array([], dtype=np.float64)
+        if exclude_final and n_total >= 2:
+            acc_use = accuracies[:-1]
+            ece_use = eces[:-1]
+        else:
+            acc_use = accuracies
+            ece_use = eces
+
         raw_metrics = np.array(
-            [1.0 - (acc / max(ece, 1e-8)) for acc, ece in zip(accuracies, eces)],
+            [1.0 - (acc / max(ece, 1e-8)) for acc, ece in zip(acc_use, ece_use)],
             dtype=np.float64,
         )
         min_v = np.min(raw_metrics) - epsilon
         max_v = np.max(raw_metrics) + epsilon
         denom = max(max_v - min_v, 1e-8)
-        return (raw_metrics - min_v) / denom
+        tau_norm = (raw_metrics - min_v) / denom
+
+        if exclude_final and n_total >= 2:
+            return np.concatenate([tau_norm, np.array([0.0], dtype=np.float64)])
+        return tau_norm
 
     def apply_thresholds(
         self, thresholds: Union[float, Sequence[float], Dict[int, float]]
@@ -758,7 +773,7 @@ class EarlyExitPolicy:
 
         for sample_id in range(num_samples):
             for exit_id in range(num_exits):
-                if exit_id == num_exits - 1 or msp_scores[exit_id, sample_id] > thresh_list[exit_id]:
+                if exit_id == num_exits - 1 or msp_scores[exit_id, sample_id] >= thresh_list[exit_id]:
                     exits_store[sample_id] = exit_id
                     predictions[sample_id] = torch.from_numpy(self.logits[exit_id, sample_id])
                     break

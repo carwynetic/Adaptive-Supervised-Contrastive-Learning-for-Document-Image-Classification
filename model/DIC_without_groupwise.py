@@ -152,6 +152,52 @@ class DICWithoutGroupwise(nn.Module):
             cls_tokens_dict=cls_tokens_dict,
         )
 
+    @torch.no_grad()
+    def forward_early_exit(
+        self,
+        input_ids: torch.Tensor,
+        bbox: torch.Tensor,
+        pixel_values: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        criterion: str = "max_confidence",
+        threshold: float = 0.8,
+        exit_thresholds: Optional[Dict[int, float]] = None,
+        temperatures: Optional[Dict[int, float]] = None,
+    ) -> Tuple[torch.Tensor, int]:
+        """
+        True Anytime Early-Exit inference (stops Transformer execution as soon as an exit satisfies threshold).
+        Intended for batch_size=1 wall-clock latency benchmarking and real-time deployment.
+        """
+        from model.modules.ee_modules import entropy, max_confidence, top12_margin
+
+        final_layer = self.exit_layers[-1]
+
+        def _exit_fn(layer: int, feat: torch.Tensor) -> Tuple[torch.Tensor, bool]:
+            logits = self.exit_heads[str(layer)](feat)
+            if temperatures is not None and layer in temperatures:
+                logits = logits / float(temperatures[layer])
+            if layer == final_layer:
+                return logits, True
+            tau = float(exit_thresholds[layer]) if (exit_thresholds is not None and layer in exit_thresholds) else float(threshold)
+            if criterion == "max_confidence":
+                should_stop = bool((max_confidence(logits) >= tau).all())
+            elif criterion == "entropy":
+                should_stop = bool((entropy(logits) <= tau).all())
+            elif criterion == "top12_margin":
+                should_stop = bool((top12_margin(logits) >= tau).all())
+            else:
+                raise ValueError(f"Unsupported criterion: {criterion}")
+            return logits, should_stop
+
+        return self.backbone.forward_early_exit(
+            input_ids=input_ids,
+            bbox=bbox,
+            pixel_values=pixel_values,
+            attention_mask=attention_mask,
+            exit_layers=self.exit_layers,
+            exit_fn=_exit_fn,
+        )
+
 
 if __name__ == "__main__":
     print("=" * 65)
