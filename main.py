@@ -628,7 +628,7 @@ def build_parser() -> argparse.ArgumentParser:
             "prepare_data",       # Tải RVL-CDIP subset + chạy OCR & lưu cache vào data_dir
             "exp1_hamed_ce",      # Chạy baseline EE gốc (Hamed et al., CE) + đo gradient conflict
             "exp2_supcon",        # Chạy without-groupwise SupCon-ST + Stage 2 probe + đo gradient conflict
-            "exp3_groupwise",     # Chạy group-wise SupCon-ST (Group 1 [0,1,4] & Group 2 [8,10,12]) + Stage 2 probe
+            "exp3_groupwise",     # Chạy 6-Group Sequential Recompute SupCon-ST ([0],[1],[4],[8],[10],[12]) + Stage 2 probe
             "run_both",           # Chạy tuần tự exp1_hamed_ce -> exp2_supcon -> visualize_all
             "visualize_all",      # Vẽ 6 biểu đồ & bảng summary từ log JSON có sẵn (không train lại)
             "train_standard",     # Chạy DICTrainer chuẩn 2 stage theo --train_type (lưu vào --save_dir)

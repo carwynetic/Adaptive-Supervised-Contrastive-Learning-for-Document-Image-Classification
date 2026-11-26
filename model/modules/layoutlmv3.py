@@ -56,6 +56,23 @@ _DEFAULT_CONFIG_DIR = _PROJECT_ROOT / "configs" / "layoutlmv3-base"
 _DEFAULT_CHECKPOINT_DIR = _PROJECT_ROOT / "checkpoints" / "layoutlmv3-base"
 
 
+def _ensure_local_checkpoint(ckpt_dir: Path, repo_id: str = "microsoft/layoutlmv3-base") -> Path:
+    has_weights = ckpt_dir.exists() and any(
+        (ckpt_dir / fname).exists()
+        for fname in ("pytorch_model.bin", "model.safetensors")
+    )
+    if not has_weights:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        from huggingface_hub import snapshot_download
+
+        snapshot_download(
+            repo_id=repo_id,
+            local_dir=str(ckpt_dir),
+            allow_patterns=["*.json", "*.bin", "*.safetensors", "*.txt"],
+        )
+    return ckpt_dir
+
+
 # ==============================================================================
 # 1. Early-Exit Classification / Gate Head
 # Source: https://github.com/Jordy-VL/multi-modal-early-exit/blob/main/EE/models/LayoutLMv3.py
@@ -761,6 +778,8 @@ class LayoutLMv3EEForSequenceClassification(LayoutLMv3ForSequenceClassification)
         """
         cfg_dir = Path(config_dir) if config_dir is not None else _DEFAULT_CONFIG_DIR
         ckpt_dir = Path(checkpoint_dir) if checkpoint_dir is not None else _DEFAULT_CHECKPOINT_DIR
+        if checkpoint_dir is None:
+            _ensure_local_checkpoint(ckpt_dir)
 
         if not cfg_dir.exists():
             raise FileNotFoundError(f"Config directory not found: {cfg_dir}")
@@ -1006,6 +1025,8 @@ class LayoutLMv3Backbone(nn.Module):
 
         self.config_dir = Path(config_dir) if config_dir is not None else _DEFAULT_CONFIG_DIR
         self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir is not None else _DEFAULT_CHECKPOINT_DIR
+        if checkpoint_dir is None:
+            _ensure_local_checkpoint(self.checkpoint_dir)
 
         if not self.config_dir.exists():
             raise FileNotFoundError(f"Config directory not found: {self.config_dir}")
@@ -1177,6 +1198,126 @@ class LayoutLMv3Backbone(nn.Module):
 
         assert last_logits is not None
         return last_logits, final_layer
+
+    def _compute_embeddings_and_meta(
+        self,
+        input_ids: torch.Tensor,
+        bbox: Optional[torch.Tensor],
+        pixel_values: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        m = self.model
+        cfg = m.config
+        input_shape = input_ids.size()
+        batch_size, seq_length = input_shape
+        device = input_ids.device
+
+        if attention_mask is None:
+            attention_mask = torch.ones((batch_size, seq_length), device=device)
+        token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
+        if bbox is None:
+            bbox = torch.zeros((batch_size, seq_length, 4), dtype=torch.long, device=device)
+
+        embedding_output = m.embeddings(
+            input_ids=input_ids,
+            bbox=bbox,
+            position_ids=None,
+            token_type_ids=token_type_ids,
+            inputs_embeds=None,
+        )
+
+        final_bbox = final_position_ids = None
+        if pixel_values is not None:
+            visual_embeddings = m.forward_image(pixel_values)
+            visual_attention_mask = torch.ones(
+                (batch_size, visual_embeddings.shape[1]), dtype=torch.long, device=device
+            )
+            attention_mask = torch.cat([attention_mask, visual_attention_mask], dim=1)
+
+            if cfg.has_relative_attention_bias or cfg.has_spatial_attention_bias:
+                if cfg.has_spatial_attention_bias:
+                    visual_bbox = m.calculate_visual_bbox(device, dtype=torch.long, batch_size=batch_size)
+                    final_bbox = torch.cat([bbox, visual_bbox], dim=1)
+                visual_position_ids = torch.arange(
+                    0, visual_embeddings.shape[1], dtype=torch.long, device=device
+                ).repeat(batch_size, 1)
+                text_pos_ids = torch.arange(0, input_shape[1], device=device).unsqueeze(0).expand(input_shape)
+                final_position_ids = torch.cat([text_pos_ids, visual_position_ids], dim=1)
+
+            embedding_output = torch.cat([embedding_output, visual_embeddings], dim=1)
+            embedding_output = m.LayerNorm(embedding_output)
+            embedding_output = m.dropout(embedding_output)
+        elif cfg.has_relative_attention_bias or cfg.has_spatial_attention_bias:
+            if cfg.has_spatial_attention_bias:
+                final_bbox = bbox
+            if cfg.has_relative_attention_bias:
+                final_position_ids = m.embeddings.position_ids[:, : input_shape[1]].expand_as(input_ids)
+
+        return embedding_output, attention_mask, final_position_ids, final_bbox
+
+    def forward_recompute_slice(
+        self,
+        input_ids: torch.Tensor,
+        bbox: Optional[torch.Tensor],
+        pixel_values: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        prev_exit: int,
+        target_exit: int,
+    ) -> torch.Tensor:
+        m = self.model
+        cfg = m.config
+        enc = m.encoder
+        device = input_ids.device
+
+        if target_exit == 0:
+            emb_out, _, _, _ = self._compute_embeddings_and_meta(input_ids, bbox, pixel_values, attention_mask)
+            return emb_out.mean(dim=1)
+
+        if prev_exit < 0:
+            emb_out, attn_mask, final_pos_ids, final_bbox = self._compute_embeddings_and_meta(
+                input_ids, bbox, pixel_values, attention_mask
+            )
+            if create_bidirectional_mask is not None:
+                ext_mask = create_bidirectional_mask(config=cfg, inputs_embeds=emb_out, attention_mask=attn_mask)
+            else:
+                ext_mask = m.get_extended_attention_mask(attn_mask, None, device, dtype=emb_out.dtype)
+            rel_pos = enc._cal_1d_pos_emb(final_pos_ids) if enc.has_relative_attention_bias else None
+            rel_2d_pos = enc._cal_2d_pos_emb(final_bbox) if enc.has_spatial_attention_bias else None
+            hidden_states = emb_out
+            for layer_idx in range(target_exit):
+                layer_out = enc.layer[layer_idx](hidden_states, ext_mask, rel_pos=rel_pos, rel_2d_pos=rel_2d_pos)
+                hidden_states = layer_out[0] if isinstance(layer_out, tuple) else layer_out
+            return hidden_states[:, 0, :]
+
+        with torch.no_grad():
+            emb_out, attn_mask, final_pos_ids, final_bbox = self._compute_embeddings_and_meta(
+                input_ids, bbox, pixel_values, attention_mask
+            )
+            if create_bidirectional_mask is not None:
+                ext_mask = create_bidirectional_mask(config=cfg, inputs_embeds=emb_out, attention_mask=attn_mask)
+            else:
+                ext_mask = m.get_extended_attention_mask(attn_mask, None, device, dtype=emb_out.dtype)
+            rel_pos_ng = enc._cal_1d_pos_emb(final_pos_ids) if enc.has_relative_attention_bias else None
+            rel_2d_pos_ng = enc._cal_2d_pos_emb(final_bbox) if enc.has_spatial_attention_bias else None
+            hidden_states = emb_out
+            for layer_idx in range(prev_exit):
+                layer_out = enc.layer[layer_idx](hidden_states, ext_mask, rel_pos=rel_pos_ng, rel_2d_pos=rel_2d_pos_ng)
+                hidden_states = layer_out[0] if isinstance(layer_out, tuple) else layer_out
+            hidden_states = hidden_states.detach()
+            ext_mask = ext_mask.detach() if isinstance(ext_mask, torch.Tensor) else ext_mask
+
+        if prev_exit == 0:
+            rel_pos = enc._cal_1d_pos_emb(final_pos_ids) if enc.has_relative_attention_bias else None
+            rel_2d_pos = enc._cal_2d_pos_emb(final_bbox) if enc.has_spatial_attention_bias else None
+        else:
+            rel_pos = rel_pos_ng.detach() if isinstance(rel_pos_ng, torch.Tensor) else rel_pos_ng
+            rel_2d_pos = rel_2d_pos_ng.detach() if isinstance(rel_2d_pos_ng, torch.Tensor) else rel_2d_pos_ng
+
+        for layer_idx in range(prev_exit, target_exit):
+            layer_out = enc.layer[layer_idx](hidden_states, ext_mask, rel_pos=rel_pos, rel_2d_pos=rel_2d_pos)
+            hidden_states = layer_out[0] if isinstance(layer_out, tuple) else layer_out
+
+        return hidden_states[:, 0, :]
 
 
 if __name__ == "__main__":

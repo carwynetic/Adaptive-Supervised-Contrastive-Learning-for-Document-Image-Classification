@@ -54,8 +54,8 @@ class DIC(nn.Module):
         # 1. Cấu hình phân nhóm các tầng Exits
         if groups is None:
             self.groups: Dict[str, Tuple[int, ...]] = {
-                "group1": tuple(l for l in self.exit_layers if l <= 4),
-                "group2": tuple(l for l in self.exit_layers if l > 4),
+                f"group{idx + 1}": (layer,)
+                for idx, layer in enumerate(self.exit_layers)
             }
         else:
             self.groups = {k: tuple(sorted(v)) for k, v in groups.items()}
@@ -248,6 +248,44 @@ class DIC(nn.Module):
         last_layer = target_layers[-1]
         final_logits = logits_dict.get(last_layer) if compute_logits else None
 
+        return DICOutput(
+            logits_dict=logits_dict,
+            final_logits=final_logits,
+            projections_dict=projections_dict,
+            cls_tokens_dict=cls_tokens_dict,
+        )
+
+    def forward_group_recompute(
+        self,
+        group_name: str,
+        prev_exit: int,
+        input_ids: torch.Tensor,
+        bbox: torch.Tensor,
+        pixel_values: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        compute_projections: bool = True,
+        compute_logits: bool = False,
+    ) -> DICOutput:
+        if group_name not in self.groups:
+            raise KeyError(f"Group '{group_name}' không tồn tại. Danh sách: {list(self.groups.keys())}")
+        target_layers = self.groups[group_name]
+        target_exit = target_layers[-1]
+        feat = self.backbone.forward_recompute_slice(
+            input_ids=input_ids,
+            bbox=bbox,
+            pixel_values=pixel_values,
+            attention_mask=attention_mask,
+            prev_exit=prev_exit,
+            target_exit=target_exit,
+        )
+        logits_dict: Dict[int, torch.Tensor] = {}
+        projections_dict: Optional[Dict[int, torch.Tensor]] = {} if compute_projections else None
+        cls_tokens_dict: Dict[int, torch.Tensor] = {target_exit: feat}
+        if compute_logits:
+            logits_dict[target_exit] = self.exit_heads[str(target_exit)](feat)
+        if compute_projections and projections_dict is not None:
+            projections_dict[target_exit] = self.projection_heads[str(target_exit)](feat)
+        final_logits = logits_dict.get(target_exit) if compute_logits else None
         return DICOutput(
             logits_dict=logits_dict,
             final_logits=final_logits,

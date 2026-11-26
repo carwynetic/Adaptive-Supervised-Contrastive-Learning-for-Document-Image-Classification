@@ -870,7 +870,11 @@ def test_checkpoint_resume_exp3_groupwise_and_run_all(tmp_path: Path) -> None:
         resume=True,
     )
     assert (e3_dir / "checkpoint_stage1_last.pt").exists()
+    assert (e3_dir / "stage1_best.pt").exists()
+    assert (e3_dir / "stage1_final.pt").exists()
     assert (e3_dir / "checkpoint_stage2_last.pt").exists()
+    assert (e3_dir / "model_best.pt").exists()
+    assert (e3_dir / "model_final.pt").exists()
     (e3_dir / "gradient_conflict_log.json").unlink()
     (e3_dir / "model_final.pt").unlink()
     (e3_dir / "checkpoint_stage2_last.pt").unlink()
@@ -891,9 +895,67 @@ def test_checkpoint_resume_exp3_groupwise_and_run_all(tmp_path: Path) -> None:
         resume=True,
     )
     assert p3_resumed["experiment"] == "exp3_groupwise"
-    assert p3_resumed["config"]["groups"] == {"group1": [0, 1, 4], "group2": [8, 10, 12]}
+    assert p3_resumed["config"]["groups"] == {
+        "group1": [0],
+        "group2": [1],
+        "group3": [4],
+        "group4": [8],
+        "group5": [10],
+        "group6": [12],
+    }
     assert [e["epoch"] for e in p3_resumed["epoch_logs"]] == [1, 2]
     assert len(p3_resumed["stage2_logs"]) == 1
+
+    from model.DIC import DIC
+    from train_test.exp_runner import _split_sequential_group_named_params
+
+    exits_6 = (0, 1, 4, 8, 10, 12)
+    m6 = DIC(num_classes=16, exit_layers=exits_6).to(device)
+    m6.eval()
+    specs_6 = [("group1", -1, 0), ("group2", 0, 1), ("group3", 1, 4), ("group4", 4, 8), ("group5", 8, 10), ("group6", 10, 12)]
+    part_6 = _split_sequential_group_named_params(m6, specs_6)
+    seen_ids: set[int] = set()
+    for gn, plist in part_6.items():
+        assert len(plist) > 0, f"Empty group: {gn}"
+        for _, p in plist:
+            pid = id(p)
+            assert pid not in seen_ids, "Parameter overlap across sequential groups"
+            seen_ids.add(pid)
+    expected_ids = {id(p) for n, p in m6.named_parameters() if not n.startswith("exit_heads.")}
+    assert seen_ids == expected_ids
+
+    dummy_in = {
+        "input_ids": torch.randint(0, 1000, (2, 16), dtype=torch.long, device=device),
+        "bbox": torch.zeros((2, 16, 4), dtype=torch.long, device=device),
+        "pixel_values": torch.randn(2, 3, 224, 224, device=device),
+        "attention_mask": torch.ones((2, 16), dtype=torch.long, device=device),
+    }
+    with torch.no_grad():
+        full_o = m6(**dummy_in, compute_projections=True, compute_logits=False)
+        for gn, prev_e, tgt_e in specs_6:
+            rec_o = m6.forward_group_recompute(gn, prev_e, **dummy_in, compute_projections=True, compute_logits=False)
+            assert torch.allclose(rec_o.projections_dict[tgt_e], full_o.projections_dict[tgt_e], atol=1e-4)
+
+    e3_fast_dir = tmp_path / "fast_e3_no_probe"
+    p3_fast = run_exp3_groupwise(
+        data_dir=tmp_path,
+        output_dir=e3_fast_dir,
+        exit_layers=exits_6,
+        batch_size=2,
+        grad_accum_steps=1,
+        epochs=1,
+        epochs_stage2=1,
+        probe_every_n_steps=0,
+        max_samples=4,
+        device=device,
+        dry_run=True,
+        resume=True,
+    )
+    assert p3_fast["step_logs"] == []
+    assert p3_fast["loss_landscape"] is None
+    assert (e3_fast_dir / "stage1_best.pt").exists()
+    assert (e3_fast_dir / "stage1_final.pt").exists()
+    assert (e3_fast_dir / "model_best.pt").exists()
 
     all_out = tmp_path / "all_run"
     parser = root_main.build_parser()
