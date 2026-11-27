@@ -1,0 +1,17 @@
+﻿Run_ID,Eval_Split,Exit_Layer,S1_Final_Train_Loss,S1_Best_Val_Loss,Acc_Uncal_Pct,ECE_Uncal,ECE_Cal,Temp_T,Heuristic_Tau,Exit_Ratio_Pct,Notes
+R01_Exp1_HamedCE_Pilot160,val (160),L0,1.9503,,31.88,0.1444,,,,,Pilot Hamed CE
+R01_Exp1_HamedCE_Pilot160,val (160),L1,0.0172,,55.63,0.2078,,,,,Đỉnh accuracy ở tầng nông
+R01_Exp1_HamedCE_Pilot160,val (160),L4,0.0189,,51.88,0.3862,,,,,
+R01_Exp1_HamedCE_Pilot160,val (160),L8,0.1448,,50.63,0.3328,,,,,
+R01_Exp1_HamedCE_Pilot160,val (160),L12,0.8830,,38.75,0.2342,,,,,Tầng sâu bị kéo tụt do conflict
+R02_Exp2_SupConNoGW_Pilot160,val (160),L0,0.4183,,29.38,0.1202,,,,,Pilot SupCon-ST không groupwise
+R02_Exp2_SupConNoGW_Pilot160,val (160),L1,0.4990,,41.88,0.1007,,,,,
+R02_Exp2_SupConNoGW_Pilot160,val (160),L4,0.5871,,23.13,0.1037,,,,,
+R02_Exp2_SupConNoGW_Pilot160,val (160),L8,0.6872,,21.25,0.0883,,,,,
+R02_Exp2_SupConNoGW_Pilot160,val (160),L12,0.7986,,18.75,0.0729,,,,,Suy thoái mạnh ở tầng sâu
+R04_Exp3_6Grp_S2_BestS1,test (400),L0,,,,,,,,,Chờ Stage 2 + Eval
+R04_Exp3_6Grp_S2_BestS1,test (400),L1,,,,,,,,,Chờ Stage 2 + Eval
+R04_Exp3_6Grp_S2_BestS1,test (400),L4,,,,,,,,,Chờ Stage 2 + Eval
+R04_Exp3_6Grp_S2_BestS1,test (400),L8,,,,,,,,,Chờ Stage 2 + Eval
+R04_Exp3_6Grp_S2_BestS1,test (400),L10,,,,,,,,,Chờ Stage 2 + Eval
+R04_Exp3_6Grp_S2_BestS1,test (400),L12,,,,,,,,,Chờ Stage 2 + Eval
